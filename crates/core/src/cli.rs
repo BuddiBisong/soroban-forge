@@ -40,7 +40,20 @@ pub fn closest_match<'a>(input: &str, candidates: &[&'a str], threshold: usize) 
     candidates.iter().map(|c| (*c, edit_distance(input, c))).filter(|(_, d)| *d <= threshold).min_by_key(|(_, d)| *d).map(|(c, _)| c)
 }
 pub fn env_flag(name: &str) -> bool {
-    std::env::var(name).map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes")).unwrap_or(false)
+    if let Ok(v) = std::env::var(name) {
+        let lower = v.to_ascii_lowercase();
+        match lower.as_str() {
+            "1" | "true" | "yes" => true,
+            "0" | "false" | "no" => false,
+            _ if !v.is_empty() => {
+                log::warn!("environment variable {}={} is not recognized; treating as false", name, v);
+                false
+            }
+            _ => false,
+        }
+    } else {
+        false
+    }
 }
 
 /// Build the top-level `soroban-forge` command from the registered plugins.
@@ -659,6 +672,20 @@ mod tests {
         assert!(matches.get_flag("json"));
     }
 
+    #[test]
+    fn env_flag_warns_on_unrecognized_value() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        std::env::set_var("TEST_FLAG_UNRECOGNIZED", "on");
+        assert!(!env_flag("TEST_FLAG_UNRECOGNIZED"));
+        std::env::remove_var("TEST_FLAG_UNRECOGNIZED");
+
+        std::env::set_var("TEST_FLAG_YES", "yes");
+        assert!(env_flag("TEST_FLAG_YES"));
+        std::env::remove_var("TEST_FLAG_YES");
+
+        std::env::set_var("TEST_FLAG_FALSE", "false");
+        assert!(!env_flag("TEST_FLAG_FALSE"));
+        std::env::remove_var("TEST_FLAG_FALSE");
     /// The optimize subcommand must advertise `--in-place` and accept it.
     /// We use a real `OptimizePlugin` here because core cannot otherwise
     /// reference it — this exercises the same core-side injection the
