@@ -529,6 +529,39 @@ impl ForgePlugin for OptimizePlugin {
 mod tests {
     use super::*;
 
+    /// The optimize subcommand must advertise `--in-place` and accept it.
+    /// This lives here rather than in `soroban-forge-core` (where it was
+    /// originally written, referencing `OptimizePlugin` as a dev-dependency)
+    /// because that created a dependency cycle: `optimize` already depends
+    /// on `core` normally, so `core`'s test binary and `optimize`'s own
+    /// build ended up linking two different copies of `core`, and the
+    /// `ForgePlugin` trait from one didn't satisfy the other (E0277). Calling
+    /// core's own `build_command` from here, where the dependency is
+    /// one-directional, exercises the exact same plugin-injection path
+    /// without the cycle.
+    #[test]
+    fn optimize_subcommand_exposes_in_place_flag() {
+        let plugins: Vec<Box<dyn ForgePlugin>> = vec![Box::new(OptimizePlugin)];
+        let mut cmd = soroban_forge_core::cli::build_command(&plugins);
+
+        // The top-level `--help` only lists subcommand names, not their own
+        // flags — the `optimize` subcommand's own help is what must mention
+        // `--in-place`.
+        let help = cmd
+            .find_subcommand_mut("optimize")
+            .expect("optimize subcommand is registered")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--in-place"), "{help}");
+
+        let matches = cmd
+            .try_get_matches_from(["soroban-forge", "optimize", "--in-place"])
+            .unwrap();
+        let (name, sub) = matches.subcommand().unwrap();
+        assert_eq!(name, "optimize");
+        assert!(sub.get_flag("in-place"));
+    }
+
     #[test]
     fn locates_wasm_by_crate_name() {
         assert_eq!(
