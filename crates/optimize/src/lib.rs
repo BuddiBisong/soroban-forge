@@ -562,6 +562,24 @@ mod tests {
         assert!(sub.get_flag("in-place"));
     }
 
+    /// #258: `[optimize] max-size` is parsed by this crate's own `ForgeConfig`
+    /// above, entirely separate from `soroban-forge-core`'s — so nothing there
+    /// would ever catch this key drifting out of sync with the docs. Add a new
+    /// field to this file's `ForgeConfig`/`OptimizeConfig`? Add its key here,
+    /// and to `docs/configuration.md`'s forge.toml reference table.
+    #[test]
+    fn every_key_is_documented() {
+        let docs_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/configuration.md");
+        let docs = std::fs::read_to_string(&docs_path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", docs_path.display()));
+        assert!(
+            docs.contains("`[optimize] max-size`"),
+            "docs/configuration.md is missing a row for [optimize] max-size — \
+             update its forge.toml reference table"
+        );
+    }
+
     #[test]
     fn locates_wasm_by_crate_name() {
         assert_eq!(
