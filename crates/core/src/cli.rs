@@ -686,6 +686,8 @@ mod tests {
         std::env::set_var("TEST_FLAG_FALSE", "false");
         assert!(!env_flag("TEST_FLAG_FALSE"));
         std::env::remove_var("TEST_FLAG_FALSE");
+    }
+
     /// The optimize subcommand must advertise `--in-place` and accept it.
     /// We use a real `OptimizePlugin` here because core cannot otherwise
     /// reference it — this exercises the same core-side injection the
