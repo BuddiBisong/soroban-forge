@@ -285,7 +285,7 @@ impl {{contract_type}}InvariantModel {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(50))]
+    #![proptest_config(ProptestConfig::with_cases({{prop_cases}}))]
 
     #[test]
     fn {{fn_name}}_property_invariants_hold(
@@ -817,7 +817,7 @@ pub fn build_token_fixture(info: &ContractInfo) -> String {
 }
 
 /// Render the `tests/forge_invariant.rs` content for all `#[contract]` structs found.
-pub fn build_invariant_test(info: &ContractInfo) -> String {
+pub fn build_invariant_test(info: &ContractInfo, prop_cases: u32) -> String {
     let mut out = String::from(INVARIANT_TEST_RS);
 
     let mut use_parts: Vec<String> = Vec::new();
@@ -836,6 +836,7 @@ pub fn build_invariant_test(info: &ContractInfo) -> String {
         vars.insert("contract_type".into(), ct.clone());
         vars.insert("fn_name".into(), to_snake_case(ct));
         vars.insert("contract_args".into(), info.constructor_args.clone());
+        vars.insert("prop_cases".into(), prop_cases.to_string());
 
         out.push_str(&render_str(INVARIANT_TEST_FN, &vars));
     }
@@ -1454,6 +1455,8 @@ pub struct GenerateOptions {
     pub fail_on_uncovered: bool,
     /// Also emit an ignored test that deploys and invokes against localnet.
     pub localnet: bool,
+    /// Number of cases for property-based tests (default: 50).
+    pub prop_cases: u32,
 }
 
 impl Default for GenerateOptions {
@@ -1466,6 +1469,7 @@ impl Default for GenerateOptions {
             actor_count: DEFAULT_ACTOR_COUNT,
             fail_on_uncovered: false,
             localnet: false,
+            prop_cases: 50,
         }
     }
 }
@@ -1638,7 +1642,7 @@ pub fn generate_with_options_layout(
     let info = detect::inspect(dir)?;
 
     let smoke = build_smoke_test(&info);
-    let invariant = build_invariant_test(&info);
+    let invariant = build_invariant_test(&info, options.prop_cases);
     let snapshot = build_snapshot_test(&info);
     let event_test = build_event_test(&info);
     let err_tests = build_error_path_tests(&info);
@@ -2046,6 +2050,13 @@ impl ForgePlugin for TestgenPlugin {
                     .help("Generate a proptest-based invariant testing harness"),
             )
             .arg(
+                Arg::new("prop-cases")
+                    .long("prop-cases")
+                    .value_name("N")
+                    .value_parser(clap::value_parser!(u32))
+                    .help("Number of property-test cases to run (default: 50)"),
+            )
+            .arg(
                 Arg::new("fuzz")
                     .long("fuzz")
                     .action(ArgAction::SetTrue)
@@ -2157,6 +2168,7 @@ impl ForgePlugin for TestgenPlugin {
             actor_count: matches.get_one::<usize>("actors").copied().unwrap_or(DEFAULT_ACTOR_COUNT),
             fail_on_uncovered: matches.get_flag("fail-on-uncovered"),
             localnet: matches.get_flag("localnet"),
+            prop_cases: matches.get_one::<u32>("prop-cases").copied().unwrap_or(50),
         };
         let fuzz = options.fuzz;
 
@@ -2616,7 +2628,7 @@ impl VaultContract {
     #[test]
     fn build_invariant_test_emits_models_and_proptests() {
         let info = multi_contract_info(false, true);
-        let invariant = build_invariant_test(&info);
+        let invariant = build_invariant_test(&info, 50);
 
         assert!(invariant.contains("use proptest::prelude::*;"));
         assert!(invariant.contains("use demo::{ Foo, FooClient, Bar, BarClient };"));
@@ -2624,6 +2636,7 @@ impl VaultContract {
         assert!(invariant.contains("struct BarInvariantModel"));
         assert!(invariant.contains("fn foo_property_invariants_hold"));
         assert!(invariant.contains("fn bar_property_invariants_hold"));
+        assert!(invariant.contains("with_cases(50)"));
         assert!(!invariant.contains("{{"));
     }
 
