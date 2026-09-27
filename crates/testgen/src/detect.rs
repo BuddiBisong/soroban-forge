@@ -122,9 +122,12 @@ pub fn inspect(dir: &Path) -> Result<ContractInfo> {
 
     let contract_types = find_contract_types(&source);
     if contract_types.is_empty() {
-        return Err(ForgeError::Other(format!(
-            "no #[contract] struct found in {} (inspected)",
-            lib_path.display()
+        return Err(ForgeError::InvalidArgument(format!(
+            "no #[contract] struct found in {} for crate `{}` — test-init needs at least one \
+             #[contract]-annotated struct to generate a harness for; add one, or point --path at \
+             the Soroban contract crate you meant to target",
+            lib_path.display(),
+            manifest.package.name,
         )));
     }
 
@@ -853,6 +856,49 @@ soroban-sdk = { version = "1", features = ["testutils"] }
         assert!(info.methods.is_empty());
         assert!(info.events.is_empty());
         assert!(!info.has_contractevent);
+    }
+
+    /// Issue #345: `inspect` (and therefore `test-init`) must fail loudly with a
+    /// clear, actionable, user-error-exit-code error when the crate has no
+    /// `#[contract]` struct at all, rather than silently no-op'ing or exiting
+    /// with an internal-error code.
+    #[test]
+    fn inspect_fails_clearly_with_zero_contract_structs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            r#"
+[package]
+name = "not-a-contract"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .unwrap();
+        // A plain lib crate: no #[contract]-annotated struct anywhere.
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn helper() -> u32 {\n    42\n}\n",
+        )
+        .unwrap();
+
+        let err = inspect(dir.path()).expect_err("crate with no #[contract] struct must error");
+
+        // Must be a user error (exit code 1), not an internal error (exit code 3).
+        assert_eq!(err.exit_code(), soroban_forge_core::error::ExitCode::UserError);
+
+        let message = err.to_string();
+        // Names the crate...
+        assert!(
+            message.contains("not-a-contract"),
+            "error should name the crate: {message}"
+        );
+        // ...and suggests how to fix it.
+        assert!(
+            message.contains("#[contract]"),
+            "error should mention #[contract]: {message}"
+        );
     }
 
     #[test]

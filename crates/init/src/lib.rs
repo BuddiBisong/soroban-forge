@@ -128,7 +128,7 @@ impl ForgePlugin for InitPlugin {
 
         let mut test_files = Vec::new();
         if matches.get_flag("tests") {
-            let (_, written) = soroban_forge_testgen::generate(&dir, false, false)?;
+            let (_, written, _) = soroban_forge_testgen::generate(&dir, false, false)?;
             test_files = written.into_iter().map(ToString::to_string).collect();
         }
 
