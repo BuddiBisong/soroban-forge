@@ -6,6 +6,8 @@
 - [Zero to Deployed Testnet Tutorial](tutorial-zero-to-testnet.md)
 - [Architecture](architecture.md)
 - [Configuration](configuration.md)
+- [Plugins](plugins.md)
+  - [Writing a soroban-forge plugin](plugin-tutorial.md)
 - [Templates Reference](templates.md)
   - [Template Catalogue](template-catalogue.md)
   - [Security Considerations](security-considerations.md)
