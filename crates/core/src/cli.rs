@@ -153,30 +153,7 @@ pub fn build_command(plugins: &[Box<dyn ForgePlugin>]) -> Command {
                 .help("Load defaults from PATH instead of discovering forge.toml"),
         );
     for plugin in plugins {
-        let mut subcmd = plugin.command();
-        if plugin.name() == "optimize" {
-            subcmd = subcmd
-                .arg(
-                    Arg::new("in-place")
-                        .long("in-place")
-                        .action(ArgAction::SetTrue)
-                        .help("Overwrite the input wasm with the optimized bytes and remove the .optimized.wasm file"),
-                )
-                .arg(
-                    Arg::new("check")
-                        .long("check")
-                        .action(ArgAction::SetTrue)
-                        .help("Fail if the optimized wasm exceeds --max-size"),
-                )
-                .arg(
-                    Arg::new("max-size")
-                        .long("max-size")
-                        .value_name("BYTES")
-                        .value_parser(clap::value_parser!(u64))
-                        .help("Maximum size in bytes for the optimized wasm"),
-                );
-        }
-        cmd = cmd.subcommand(subcmd);
+        cmd = cmd.subcommand(plugin.command());
     }
     cmd = cmd.subcommand(
         Command::new("completions")
@@ -686,25 +663,5 @@ mod tests {
         std::env::set_var("TEST_FLAG_FALSE", "false");
         assert!(!env_flag("TEST_FLAG_FALSE"));
         std::env::remove_var("TEST_FLAG_FALSE");
-    /// The optimize subcommand must advertise `--in-place` and accept it.
-    /// We use a real `OptimizePlugin` here because core cannot otherwise
-    /// reference it — this exercises the same core-side injection the
-    /// binary relies on.
-    #[test]
-    fn optimize_subcommand_exposes_in_place_flag() {
-        use soroban_forge_optimize::OptimizePlugin;
-
-        let plugins: Vec<Box<dyn ForgePlugin>> = vec![Box::new(OptimizePlugin)];
-        let cmd = build_command(&plugins);
-
-        let help = cmd.clone().render_long_help().to_string();
-        assert!(help.contains("--in-place"), "{help}");
-
-        let matches = cmd
-            .try_get_matches_from(["soroban-forge", "optimize", "--in-place"])
-            .unwrap();
-        let (name, sub) = matches.subcommand().unwrap();
-        assert_eq!(name, "optimize");
-        assert!(sub.get_flag("in-place"));
     }
 }
