@@ -96,10 +96,14 @@ fn devcontainer_json_template() -> String {
 /// Pinned to the same minimum Rust/stellar-cli versions `soroban-forge
 /// doctor` checks for (see `soroban_forge_core::toolchain`), so a container
 /// built from this file always passes `doctor`.
-fn devcontainer_dockerfile() -> String {
+fn devcontainer_dockerfile(image_tag: Option<&str>) -> String {
     use soroban_forge_core::toolchain::{MIN_RUST, MIN_STELLAR, WASM_TARGET};
+    let base_image = match image_tag {
+        Some(tag) => tag.to_string(),
+        None => format!("rust:{}.{}-bookworm", MIN_RUST.0, MIN_RUST.1),
+    };
     format!(
-        r#"FROM rust:{major}.{minor}-bookworm
+        r#"FROM {base_image}
 
 # Matches the minimums `soroban-forge doctor` checks for.
 RUN rustup target add {wasm_target} \
@@ -107,8 +111,7 @@ RUN rustup target add {wasm_target} \
 
 WORKDIR /workspace
 "#,
-        major = MIN_RUST.0,
-        minor = MIN_RUST.1,
+        base_image = base_image,
         wasm_target = WASM_TARGET,
         stellar_major = MIN_STELLAR.0,
     )
@@ -152,7 +155,10 @@ pub fn load_manifest(name: &str) -> Result<TemplateManifest> {
             let raw = file.contents_utf8().ok_or_else(|| {
                 ForgeError::Template(format!("{MANIFEST_FILE_NAME} is not UTF-8"))
             })?;
-            manifest::parse_manifest(raw)
+            let manifest = manifest::parse_manifest(raw)?;
+            let installed_version = env!("CARGO_PKG_VERSION");
+            manifest.check_version_compatibility(name, installed_version)?;
+            Ok(manifest)
         }
         None => Ok(TemplateManifest::default()),
     }
@@ -468,9 +474,23 @@ pub fn generate(template: &str, dest: &Path, vars: &Vars, force: bool) -> Result
         return Err(ForgeError::AlreadyExists(dest.to_path_buf()));
     }
 
-    render_dir(template_dir, template, dest, vars)?;
-    compose_partials(template, dest, vars)?;
-    write_forge_toml(dest, vars)?;
+    let dest_existed = dest.exists();
+
+    if let Err(e) = (|| {
+        render_dir(template_dir, template, dest, vars)?;
+        compose_partials(template, dest, vars)?;
+        write_forge_toml(dest, vars)?;
+        Ok::<(), ForgeError>(())
+    })() {
+        if !dest_existed {
+            let _ = std::fs::remove_dir_all(dest);
+        }
+        return Err(ForgeError::Other(format!(
+            "generation failed (partially-written files rolled back): {}",
+            e
+        )));
+    }
+
     Ok(())
 }
 
@@ -952,7 +972,7 @@ fn write_license_file(dest: &Path, license_id: &str, author: &str, force: bool) 
 /// Write `.devcontainer/{devcontainer.json,Dockerfile}` into `dest` and
 /// document it in the generated `README.md`. Respects `force` the same way
 /// `write_pre_commit_config` does.
-fn write_devcontainer(dest: &Path, vars: &Vars, force: bool) -> Result<()> {
+fn write_devcontainer(dest: &Path, vars: &Vars, force: bool, image_tag: Option<&str>) -> Result<()> {
     let dir = dest.join(".devcontainer");
     let json_path = dir.join("devcontainer.json");
     let dockerfile_path = dir.join("Dockerfile");
@@ -963,7 +983,7 @@ fn write_devcontainer(dest: &Path, vars: &Vars, force: bool) -> Result<()> {
         .map_err(ForgeError::io(format!("creating {}", dir.display())))?;
     std::fs::write(&json_path, render_str(&devcontainer_json_template(), vars))
         .map_err(ForgeError::io(format!("writing {}", json_path.display())))?;
-    std::fs::write(&dockerfile_path, devcontainer_dockerfile())
+    std::fs::write(&dockerfile_path, devcontainer_dockerfile(image_tag))
         .map_err(ForgeError::io(format!("writing {}", dockerfile_path.display())))?;
 
     // Document it in the generated README, when the template has one.
@@ -1162,6 +1182,12 @@ impl ForgePlugin for ScaffoldPlugin {
                     .long("devcontainer")
                     .action(ArgAction::SetTrue)
                     .help("Add a .devcontainer/ with Rust, wasm32v1-none and stellar-cli preinstalled"),
+            )
+            .arg(
+                Arg::new("devcontainer-image")
+                    .long("devcontainer-image")
+                    .value_name("TAG")
+                    .help("Base image tag for .devcontainer/Dockerfile [default: rust:MIN_RUST_VERSION-bookworm]"),
             )
             .arg(
                 Arg::new("no-tests")
@@ -1409,7 +1435,8 @@ impl ForgePlugin for ScaffoldPlugin {
         }
 
         if matches.get_flag("devcontainer") {
-            write_devcontainer(&dest, &vars, force)?;
+            let image_tag = matches.get_one::<String>("devcontainer-image").map(String::as_str);
+            write_devcontainer(&dest, &vars, force, image_tag)?;
         }
 
         if !ctx.quiet {
@@ -2010,7 +2037,7 @@ default = "MYT"
         let dest = dir.path().join("demo");
         let vars = project_vars("demo", "A", "2021");
         generate("hello-world", &dest, &vars, false).unwrap();
-        write_devcontainer(&dest, &vars, false).unwrap();
+        write_devcontainer(&dest, &vars, false, None).unwrap();
 
         let json = std::fs::read_to_string(dest.join(".devcontainer/devcontainer.json")).unwrap();
         assert!(json.contains("\"name\": \"demo\""));
@@ -2031,12 +2058,12 @@ default = "MYT"
         let dest = dir.path().join("demo");
         let vars = project_vars("demo", "A", "2021");
         generate("hello-world", &dest, &vars, false).unwrap();
-        write_devcontainer(&dest, &vars, false).unwrap();
+        write_devcontainer(&dest, &vars, false, None).unwrap();
         assert!(matches!(
-            write_devcontainer(&dest, &vars, false),
+            write_devcontainer(&dest, &vars, false, None),
             Err(ForgeError::AlreadyExists(_))
         ));
-        write_devcontainer(&dest, &vars, true).unwrap();
+        write_devcontainer(&dest, &vars, true, None).unwrap();
     }
 
     #[test]

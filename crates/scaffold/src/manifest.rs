@@ -81,6 +81,9 @@ pub struct TemplateManifest {
     /// Optional one-line description (overrides the built-in catalogue entry).
     #[serde(default)]
     pub description: Option<String>,
+    /// Minimum soroban-forge version required to use this template (e.g., "0.5.0").
+    #[serde(default, rename = "min-forge-version")]
+    pub min_forge_version: Option<String>,
     /// Custom variables this template needs.
     #[serde(default, rename = "variable", alias = "variables")]
     pub variables: Vec<TemplateVariable>,
@@ -101,10 +104,48 @@ impl TemplateManifest {
         Ok(manifest)
     }
 
+    /// Check if the installed forge version meets the template's minimum requirement.
+    /// If the template requires a newer version, returns an error with the required and installed versions.
+    pub fn check_version_compatibility(&self, template_name: &str, installed_version: &str) -> Result<()> {
+        if let Some(required_version) = &self.min_forge_version {
+            if compare_versions(installed_version, required_version) == std::cmp::Ordering::Less {
+                return Err(ForgeError::Template(format!(
+                    "template `{template_name}` requires soroban-forge >= {required_version}, but {} is installed",
+                    installed_version
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Post-generation hints to print after `next steps`, in declared order.
     pub fn hints(&self) -> &[String] {
         &self.post_generate.hints
     }
+}
+
+/// Compare two semantic version strings. Returns Ordering of the first version relative to the second.
+/// Handles versions like "0.5.0", "1.2.3", etc.
+fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    let parse_version = |v: &str| -> Vec<u32> {
+        v.split('.')
+            .filter_map(|part| part.parse::<u32>().ok())
+            .collect()
+    };
+
+    let a_parts = parse_version(a);
+    let b_parts = parse_version(b);
+
+    for i in 0..a_parts.len().max(b_parts.len()) {
+        let a_part = a_parts.get(i).copied().unwrap_or(0);
+        let b_part = b_parts.get(i).copied().unwrap_or(0);
+        match a_part.cmp(&b_part) {
+            std::cmp::Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+
+    std::cmp::Ordering::Equal
 }
 
 /// Parse a `template.toml`, rejecting manifests that redeclare a reserved
@@ -244,6 +285,7 @@ mod tests {
     fn manifest_with(vars: &[TemplateVariable]) -> TemplateManifest {
         TemplateManifest {
             description: None,
+            min_forge_version: None,
             variables: vars.to_vec(),
             post_generate: PostGenerate::default(),
         }
