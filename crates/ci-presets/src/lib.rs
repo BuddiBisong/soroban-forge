@@ -41,6 +41,7 @@ pub fn output_dir(provider: &str) -> &'static str {
         "github" => ".github/workflows",
         "gitlab" | "bitbucket" | "azure" | "woodpecker" => ".",
         "circleci" => ".circleci",
+        "buildkite" => ".buildkite",
         _ => unreachable!("validated against available_providers()"),
     }
 }
@@ -156,6 +157,7 @@ pub fn generate(
         "azure" => vec![("azure-pipelines.yml", None)],
         "circleci" => vec![("config.yml", None)],
         "woodpecker" => vec![(".woodpecker.yml", None)],
+        "buildkite" => vec![("pipeline.yml", None)],
         _ => {
             return Err(ForgeError::InvalidArgument(format!(
                 "unknown provider `{provider}` (available: {})",
@@ -317,7 +319,7 @@ impl ForgePlugin for CiPresetsPlugin {
                 Arg::new("provider")
                     .long("provider")
                     .default_value("github")
-                    .help("CI provider (`github`, `gitlab`, `circleci`, `azure`, `bitbucket`, or `woodpecker`)"),
+                    .help("CI provider (`github`, `gitlab`, `circleci`, `azure`, `bitbucket`, `woodpecker`, or `buildkite`)"),
             )
             .arg(Arg::new("deploy").long("deploy").action(ArgAction::SetTrue))
             .arg(Arg::new("security-scan").long("security-scan").action(ArgAction::SetTrue))
@@ -391,6 +393,7 @@ impl ForgePlugin for CiPresetsPlugin {
                 "azure" => vec![("azure-pipelines.yml", None)],
                 "circleci" => vec![("config.yml", None)],
                 "woodpecker" => vec![(".woodpecker.yml", None)],
+                "buildkite" => vec![("pipeline.yml", None)],
                 _ => return Err(ForgeError::InvalidArgument(format!(
                     "unknown provider `{provider}` (available: {})",
                     available_providers().join(", ")
@@ -570,6 +573,7 @@ mod tests {
         assert!(providers.contains(&"bitbucket"));
         assert!(providers.contains(&"azure"));
         assert!(providers.contains(&"woodpecker"));
+        assert!(providers.contains(&"buildkite"));
     }
 
     #[test]
@@ -629,6 +633,130 @@ mod tests {
         assert!(contents.contains("cargo build --target wasm32v1-none --release"));
         assert!(contents.contains("cargo clippy --all-targets -- -D warnings"));
         assert!(!contents.contains("{{project_name}}"));
+    }
+
+    #[test]
+    fn writes_buildkite_preset() {
+        let dir = tempfile::tempdir().unwrap();
+        let written = generate(
+            dir.path(),
+            "buildkite",
+            "my-contract",
+            false,
+            false,
+            &base_opts(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(written, vec![".buildkite/pipeline.yml"]);
+        let contents = std::fs::read_to_string(dir.path().join(".buildkite/pipeline.yml")).unwrap();
+        assert!(contents.contains("my-contract"));
+        assert!(contents.contains("cargo test"));
+        assert!(contents.contains("cargo build --target wasm32v1-none --release"));
+        assert!(contents.contains("MAX_WASM_BYTES"));
+        assert!(!contents.contains("{{project_name}}"));
+        assert!(!contents.contains("{{max_size}}"));
+    }
+
+    /// Structural validation against Buildkite's pipeline schema
+    /// (https://buildkite.com/docs/pipelines/configure/step-types/command-step):
+    /// a pipeline is a mapping with a `steps` sequence, and every command step
+    /// (one with a `command`/`commands` key, as opposed to `wait`/`block`/
+    /// `input`/`trigger`/`group`) has the shapes those keys require.
+    fn assert_valid_buildkite_pipeline(yaml: &str) {
+        let doc: serde_yaml::Value = serde_yaml::from_str(yaml).expect("valid YAML");
+        let root = doc.as_mapping().expect("pipeline root must be a mapping");
+
+        if let Some(env) = root.get("env") {
+            let env = env.as_mapping().expect("`env` must be a mapping");
+            for (key, _) in env {
+                assert!(key.as_str().is_some(), "`env` keys must be strings");
+            }
+        }
+
+        let steps = root
+            .get("steps")
+            .expect("pipeline must have a top-level `steps` key")
+            .as_sequence()
+            .expect("`steps` must be a sequence");
+        assert!(!steps.is_empty(), "`steps` must not be empty");
+
+        for step in steps {
+            let step = step.as_mapping().expect("each step must be a mapping");
+
+            if let Some(label) = step.get("label") {
+                assert!(label.as_str().is_some(), "`label` must be a string");
+            }
+            if let Some(key) = step.get("key") {
+                assert!(key.as_str().is_some(), "`key` must be a string");
+            }
+            if let Some(depends_on) = step.get("depends_on") {
+                assert!(
+                    depends_on.as_str().is_some() || depends_on.as_sequence().is_some(),
+                    "`depends_on` must be a string or a sequence of strings"
+                );
+            }
+
+            let command = step.get("command").or_else(|| step.get("commands"));
+            if let Some(command) = command {
+                let is_valid = command.as_str().is_some()
+                    || command
+                        .as_sequence()
+                        .is_some_and(|seq| seq.iter().all(|c| c.as_str().is_some()));
+                assert!(
+                    is_valid,
+                    "`command`/`commands` must be a string or a sequence of strings, got {command:?}"
+                );
+            } else {
+                // Not a command step — one of `wait`/`block`/`input`/`trigger`/`group`,
+                // which this preset never emits, but a real pipeline may mix in.
+                assert!(
+                    step.get("wait").is_some()
+                        || step.get("block").is_some()
+                        || step.get("input").is_some()
+                        || step.get("trigger").is_some()
+                        || step.get("group").is_some(),
+                    "step has neither `command`/`commands` nor a recognised non-command step key: {step:?}"
+                );
+                continue;
+            }
+
+            if let Some(plugins) = step.get("plugins") {
+                let plugins = plugins.as_sequence().expect("`plugins` must be a sequence");
+                for plugin in plugins {
+                    let plugin = plugin
+                        .as_mapping()
+                        .expect("each plugin entry must be a mapping");
+                    assert_eq!(
+                        plugin.len(),
+                        1,
+                        "each plugin entry must have exactly one key (the plugin reference)"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn buildkite_pipeline_validates_against_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        generate(
+            dir.path(),
+            "buildkite",
+            "my-contract",
+            false,
+            false,
+            &base_opts(),
+            false,
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(dir.path().join(".buildkite/pipeline.yml")).unwrap();
+        assert_valid_buildkite_pipeline(&contents);
+
+        // The steps this preset is required to emit (#240): build, test and
+        // contract-size, mirroring the GitHub build-test preset's jobs.
+        assert!(contents.contains("build & test"));
+        assert!(contents.contains("contract size"));
     }
 
     #[test]

@@ -664,17 +664,31 @@ pub fn write_bench_files(dir: &Path, info: &ContractInfo, force: bool) -> Result
 
     let mut written = Vec::new();
 
+    // Idempotent re-run (#238): unchanged content converges without
+    // rewriting or requiring `--force`; differing content still does.
     let rel = "benches/forge_bench.rs";
     let path = dir.join(rel);
-    if path.exists() && !force {
-        return Err(ForgeError::AlreadyExists(path));
+    let needs_write = if path.exists() {
+        let existing = std::fs::read_to_string(&path)
+            .map_err(ForgeError::io(format!("reading {}", path.display())))?;
+        if existing == contents {
+            false
+        } else if force {
+            true
+        } else {
+            return Err(ForgeError::AlreadyExists(path));
+        }
+    } else {
+        true
+    };
+    if needs_write {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(ForgeError::io(format!("creating {}", parent.display())))?;
+        }
+        std::fs::write(&path, &contents)
+            .map_err(ForgeError::io(format!("writing {}", path.display())))?;
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(ForgeError::io(format!("creating {}", parent.display())))?;
-    }
-    std::fs::write(&path, contents)
-        .map_err(ForgeError::io(format!("writing {}", path.display())))?;
     written.push(rel);
 
     // Without the `[[bench]]` target and the criterion dev-dependency,
@@ -695,24 +709,38 @@ pub fn write_bench_files(dir: &Path, info: &ContractInfo, force: bool) -> Result
 pub fn write_coverage_script(dir: &Path, force: bool) -> Result<&'static str> {
     let rel = "scripts/coverage.sh";
     let path = dir.join(rel);
-    if path.exists() && !force {
-        return Err(ForgeError::AlreadyExists(path));
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(ForgeError::io(format!("creating {}", parent.display())))?;
-    }
-    std::fs::write(&path, COVERAGE_SCRIPT)
-        .map_err(ForgeError::io(format!("writing {}", path.display())))?;
-    // Make the script executable on Unix.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&path, perms).map_err(ForgeError::io(format!(
-            "setting permissions on {}",
-            path.display()
-        )))?;
+    // Idempotent re-run (#238): unchanged content converges without
+    // rewriting or requiring `--force`; differing content still does.
+    let needs_write = if path.exists() {
+        let existing = std::fs::read_to_string(&path)
+            .map_err(ForgeError::io(format!("reading {}", path.display())))?;
+        if existing == COVERAGE_SCRIPT {
+            false
+        } else if force {
+            true
+        } else {
+            return Err(ForgeError::AlreadyExists(path));
+        }
+    } else {
+        true
+    };
+    if needs_write {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(ForgeError::io(format!("creating {}", parent.display())))?;
+        }
+        std::fs::write(&path, COVERAGE_SCRIPT)
+            .map_err(ForgeError::io(format!("writing {}", path.display())))?;
+        // Make the script executable on Unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o755);
+            std::fs::set_permissions(&path, perms).map_err(ForgeError::io(format!(
+                "setting permissions on {}",
+                path.display()
+            )))?;
+        }
     }
     Ok(rel)
 }
@@ -1894,6 +1922,44 @@ pub fn generate_with_options_layout(
         }
         std::fs::write(&path, embed_hash_marker(rel, &contents))
             .map_err(ForgeError::io(format!("writing {}", path.display())))?;
+    // Validate every target before writing any of them (issue #238): a file
+    // whose on-disk content already matches what generation would produce is
+    // left alone rather than rewritten or treated as a conflict — re-running
+    // test-init with unchanged inputs must converge on the same tree, not
+    // fail outright. A file that exists with *different* content (edited by
+    // the user, or stale from a contract that has since changed) still
+    // requires `--force`, and is refused here before anything is written, so
+    // a blocked run never leaves the tree half-updated.
+    let mut plan: Vec<(&'static str, String, bool)> = Vec::with_capacity(files.len());
+    for (rel, contents) in files {
+        let path = dir.join(rel);
+        let needs_write = if path.exists() {
+            let existing = std::fs::read_to_string(&path)
+                .map_err(ForgeError::io(format!("reading {}", path.display())))?;
+            if existing == contents {
+                false
+            } else if options.force {
+                true
+            } else {
+                return Err(ForgeError::AlreadyExists(path));
+            }
+        } else {
+            true
+        };
+        plan.push((rel, contents, needs_write));
+    }
+
+    let mut written = Vec::new();
+    for (rel, contents, needs_write) in plan {
+        if needs_write {
+            let path = dir.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(ForgeError::io(format!("creating {}", parent.display())))?;
+            }
+            std::fs::write(&path, contents)
+                .map_err(ForgeError::io(format!("writing {}", path.display())))?;
+        }
         written.push(rel);
     }
 
@@ -2827,11 +2893,59 @@ impl VaultContract {
         hello_world_project(&dir);
 
         generate(&dir, false, false).unwrap();
+
+        // A bare re-run with nothing changed converges (#238) rather than
+        // erroring — the conflict this test is about only exists once a
+        // generated file has actually been modified.
+        std::fs::write(
+            dir.join("tests/forge_smoke.rs"),
+            "// hand-edited by the user\n",
+        )
+        .unwrap();
         assert!(matches!(
             generate(&dir, false, false),
             Err(ForgeError::AlreadyExists(_))
         ));
         generate(&dir, true, false).unwrap();
+    }
+
+    #[test]
+    fn rerunning_with_no_changes_converges_on_the_same_tree() {
+        // #238: running test-init twice with nothing changed must produce
+        // the same tree the second time, not error and not accumulate or
+        // alter files.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("demo");
+        hello_world_project(&dir);
+
+        let (_, written_first) = generate(&dir, false, false).unwrap();
+        let snapshot_before: Vec<(String, String)> = written_first
+            .iter()
+            .map(|rel| {
+                (
+                    (*rel).to_string(),
+                    std::fs::read_to_string(dir.join(rel)).unwrap(),
+                )
+            })
+            .collect();
+
+        let (_, written_second) = generate(&dir, false, false)
+            .expect("re-running with unchanged inputs must not fail");
+        assert_eq!(written_first, written_second, "same set of files, same order");
+
+        let snapshot_after: Vec<(String, String)> = written_second
+            .iter()
+            .map(|rel| {
+                (
+                    (*rel).to_string(),
+                    std::fs::read_to_string(dir.join(rel)).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            snapshot_before, snapshot_after,
+            "re-running test-init with nothing changed must not alter any file"
+        );
     }
 
     #[test]

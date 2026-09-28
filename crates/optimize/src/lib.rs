@@ -529,6 +529,57 @@ impl ForgePlugin for OptimizePlugin {
 mod tests {
     use super::*;
 
+    /// The optimize subcommand must advertise `--in-place` and accept it.
+    /// This lives here rather than in `soroban-forge-core` (where it was
+    /// originally written, referencing `OptimizePlugin` as a dev-dependency)
+    /// because that created a dependency cycle: `optimize` already depends
+    /// on `core` normally, so `core`'s test binary and `optimize`'s own
+    /// build ended up linking two different copies of `core`, and the
+    /// `ForgePlugin` trait from one didn't satisfy the other (E0277). Calling
+    /// core's own `build_command` from here, where the dependency is
+    /// one-directional, exercises the exact same plugin-injection path
+    /// without the cycle.
+    #[test]
+    fn optimize_subcommand_exposes_in_place_flag() {
+        let plugins: Vec<Box<dyn ForgePlugin>> = vec![Box::new(OptimizePlugin)];
+        let mut cmd = soroban_forge_core::cli::build_command(&plugins);
+
+        // The top-level `--help` only lists subcommand names, not their own
+        // flags — the `optimize` subcommand's own help is what must mention
+        // `--in-place`.
+        let help = cmd
+            .find_subcommand_mut("optimize")
+            .expect("optimize subcommand is registered")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--in-place"), "{help}");
+
+        let matches = cmd
+            .try_get_matches_from(["soroban-forge", "optimize", "--in-place"])
+            .unwrap();
+        let (name, sub) = matches.subcommand().unwrap();
+        assert_eq!(name, "optimize");
+        assert!(sub.get_flag("in-place"));
+    }
+
+    /// #258: `[optimize] max-size` is parsed by this crate's own `ForgeConfig`
+    /// above, entirely separate from `soroban-forge-core`'s — so nothing there
+    /// would ever catch this key drifting out of sync with the docs. Add a new
+    /// field to this file's `ForgeConfig`/`OptimizeConfig`? Add its key here,
+    /// and to `docs/configuration.md`'s forge.toml reference table.
+    #[test]
+    fn every_key_is_documented() {
+        let docs_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/configuration.md");
+        let docs = std::fs::read_to_string(&docs_path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", docs_path.display()));
+        assert!(
+            docs.contains("`[optimize] max-size`"),
+            "docs/configuration.md is missing a row for [optimize] max-size — \
+             update its forge.toml reference table"
+        );
+    }
+
     #[test]
     fn locates_wasm_by_crate_name() {
         assert_eq!(
