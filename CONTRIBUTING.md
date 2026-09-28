@@ -50,6 +50,11 @@ pub trait ForgePlugin {
 Adding a whole new module = new crate + one `Box::new(...)` line in
 `src/main.rs`.
 
+Don't want to become a first-party module? `soroban-forge` also discovers
+any `soroban-forge-<name>` binary on `PATH` as a third-party subcommand —
+see [docs/plugin-tutorial.md](docs/plugin-tutorial.md) for a full,
+compiling walkthrough of building one outside this repo.
+
 ## Development
 
 ```sh

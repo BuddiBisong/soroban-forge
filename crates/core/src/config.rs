@@ -186,6 +186,41 @@ max_size = 65536
         std::fs::write(&path, "not [valid").unwrap();
         assert!(ForgeConfig::load_from_path(&path).is_err());
     }
+
+    /// #258: every key `ForgeConfig` parses must have a row in
+    /// `docs/configuration.md`'s forge.toml reference table, so the two
+    /// never drift apart the way `[optimize] max-size` (parsed by a
+    /// completely separate struct in `soroban-forge-optimize`, see that
+    /// crate's own `every_key_is_documented` test) had until this table
+    /// existed at all. Add a new field to `ForgeConfig` above? Add its key
+    /// here, and to the table.
+    #[test]
+    fn every_config_key_is_documented() {
+        let docs_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/configuration.md");
+        let docs = std::fs::read_to_string(&docs_path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", docs_path.display()));
+
+        let keys = [
+            "[project] name",
+            "[project] authors",
+            "[scaffold] default_template",
+            "[defaults] timeout_secs",
+            "[defaults] max_size",
+            "[defaults.ci-init] max_size",
+            "[network] name",
+            "[network] rpc_url",
+            "[network] passphrase",
+        ];
+        for key in keys {
+            let needle = format!("`{key}`");
+            assert!(
+                docs.contains(&needle),
+                "docs/configuration.md is missing a row for {key} — \
+                 update its forge.toml reference table"
+            );
+        }
+    }
 }
 
 /// Dotted paths of keys in `raw` that no [`ForgeConfig`] field matches.

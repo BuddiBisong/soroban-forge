@@ -22,6 +22,8 @@ pub mod detect;
 pub mod target;
 pub mod upgrade;
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
@@ -662,17 +664,31 @@ pub fn write_bench_files(dir: &Path, info: &ContractInfo, force: bool) -> Result
 
     let mut written = Vec::new();
 
+    // Idempotent re-run (#238): unchanged content converges without
+    // rewriting or requiring `--force`; differing content still does.
     let rel = "benches/forge_bench.rs";
     let path = dir.join(rel);
-    if path.exists() && !force {
-        return Err(ForgeError::AlreadyExists(path));
+    let needs_write = if path.exists() {
+        let existing = std::fs::read_to_string(&path)
+            .map_err(ForgeError::io(format!("reading {}", path.display())))?;
+        if existing == contents {
+            false
+        } else if force {
+            true
+        } else {
+            return Err(ForgeError::AlreadyExists(path));
+        }
+    } else {
+        true
+    };
+    if needs_write {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(ForgeError::io(format!("creating {}", parent.display())))?;
+        }
+        std::fs::write(&path, &contents)
+            .map_err(ForgeError::io(format!("writing {}", path.display())))?;
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(ForgeError::io(format!("creating {}", parent.display())))?;
-    }
-    std::fs::write(&path, contents)
-        .map_err(ForgeError::io(format!("writing {}", path.display())))?;
     written.push(rel);
 
     // Without the `[[bench]]` target and the criterion dev-dependency,
@@ -693,24 +709,38 @@ pub fn write_bench_files(dir: &Path, info: &ContractInfo, force: bool) -> Result
 pub fn write_coverage_script(dir: &Path, force: bool) -> Result<&'static str> {
     let rel = "scripts/coverage.sh";
     let path = dir.join(rel);
-    if path.exists() && !force {
-        return Err(ForgeError::AlreadyExists(path));
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(ForgeError::io(format!("creating {}", parent.display())))?;
-    }
-    std::fs::write(&path, COVERAGE_SCRIPT)
-        .map_err(ForgeError::io(format!("writing {}", path.display())))?;
-    // Make the script executable on Unix.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&path, perms).map_err(ForgeError::io(format!(
-            "setting permissions on {}",
-            path.display()
-        )))?;
+    // Idempotent re-run (#238): unchanged content converges without
+    // rewriting or requiring `--force`; differing content still does.
+    let needs_write = if path.exists() {
+        let existing = std::fs::read_to_string(&path)
+            .map_err(ForgeError::io(format!("reading {}", path.display())))?;
+        if existing == COVERAGE_SCRIPT {
+            false
+        } else if force {
+            true
+        } else {
+            return Err(ForgeError::AlreadyExists(path));
+        }
+    } else {
+        true
+    };
+    if needs_write {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(ForgeError::io(format!("creating {}", parent.display())))?;
+        }
+        std::fs::write(&path, COVERAGE_SCRIPT)
+            .map_err(ForgeError::io(format!("writing {}", path.display())))?;
+        // Make the script executable on Unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o755);
+            std::fs::set_permissions(&path, perms).map_err(ForgeError::io(format!(
+                "setting permissions on {}",
+                path.display()
+            )))?;
+        }
     }
     Ok(rel)
 }
@@ -1159,13 +1189,38 @@ pub fn build_localnet_test(info: &ContractInfo) -> String {
     render_str(LOCALNET_TEST_RS, &vars)
 }
 
+/// Builds the `cargo +nightly fuzz run fuzz_target_1` invocation, appending
+/// libFuzzer's `-runs=<N>` / `-max_total_time=<secs>` bounds (#342) when given
+/// so a CI job never fuzzes for an unbounded amount of time.
+pub fn fuzz_run_command(fuzz_runs: Option<u32>, fuzz_timeout: Option<u64>) -> String {
+    let mut cmd = String::from("cargo +nightly fuzz run fuzz_target_1");
+    if fuzz_runs.is_none() && fuzz_timeout.is_none() {
+        return cmd;
+    }
+    cmd.push_str(" --");
+    if let Some(runs) = fuzz_runs {
+        cmd.push_str(&format!(" -runs={runs}"));
+    }
+    if let Some(secs) = fuzz_timeout {
+        cmd.push_str(&format!(" -max_total_time={secs}"));
+    }
+    cmd
+}
+
 /// Render the `fuzz/fuzz_targets/fuzz_target_1.rs` content.
 ///
 /// The fuzz target exercises the first detected `#[contract]` type: it derives
 /// an `Arbitrary` `FuzzInput` enum over the contract's methods and, when the
 /// contract has a `__constructor`, a `FuzzConstructorArgs` struct for its
-/// arguments.
-pub fn generate_fuzz_target(info: &ContractInfo) -> String {
+/// arguments. `fuzz_runs` / `fuzz_timeout` (#342), when given via `test-init
+/// --fuzz --fuzz-runs <N>` / `--fuzz-timeout <secs>`, are documented in a
+/// header comment as the bounded invocation a CI job should use instead of
+/// running the fuzzer indefinitely.
+pub fn generate_fuzz_target(
+    info: &ContractInfo,
+    fuzz_runs: Option<u32>,
+    fuzz_timeout: Option<u64>,
+) -> String {
     let contract_type = info
         .contract_types
         .first()
@@ -1173,6 +1228,13 @@ pub fn generate_fuzz_target(info: &ContractInfo) -> String {
         .unwrap_or("Contract");
 
     let mut out = String::new();
+    out.push_str("// Generated by `soroban-forge test-init --fuzz`.\n");
+    out.push_str("//\n");
+    out.push_str("// For CI, bound the run so it can't fuzz indefinitely:\n");
+    out.push_str(&format!(
+        "//   {}\n",
+        fuzz_run_command(fuzz_runs, fuzz_timeout)
+    ));
     out.push_str("#![no_main]\n");
     out.push_str("use libfuzzer_sys::fuzz_target;\n");
     out.push_str("use arbitrary::Arbitrary;\n");
@@ -1434,7 +1496,7 @@ pub fn workspace_members(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
 /// Per-member result of a workspace test-init run.
 pub struct MemberHarness {
     pub member: String,
-    pub outcome: std::result::Result<(ContractInfo, Vec<&'static str>), String>,
+    pub outcome: std::result::Result<(ContractInfo, Vec<&'static str>, Vec<&'static str>), String>,
 }
 
 /// What `test-init` should emit, beyond the always-on harness files.
@@ -1457,6 +1519,16 @@ pub struct GenerateOptions {
     pub localnet: bool,
     /// Number of cases for property-based tests (default: 50).
     pub prop_cases: u32,
+    /// Bound on libFuzzer's `-runs=<N>` for the generated fuzz target's CI
+    /// invocation (#342). `None` leaves the run unbounded.
+    pub fuzz_runs: Option<u32>,
+    /// Bound on libFuzzer's `-max_total_time=<secs>` for the generated fuzz
+    /// target's CI invocation (#342). `None` leaves the run unbounded.
+    pub fuzz_timeout: Option<u64>,
+    /// Overwrite every file `--force` would, *including* ones hand-edited
+    /// since their last generation (#344). Without this, `force` skips (and
+    /// warns about) hand-edited files rather than clobbering them.
+    pub force_all: bool,
 }
 
 impl Default for GenerateOptions {
@@ -1470,6 +1542,9 @@ impl Default for GenerateOptions {
             fail_on_uncovered: false,
             localnet: false,
             prop_cases: 50,
+            fuzz_runs: None,
+            fuzz_timeout: None,
+            force_all: false,
         }
     }
 }
@@ -1602,7 +1677,75 @@ pub fn build_reentrancy_test(info: &ContractInfo) -> String {
     out
 }
 
-pub fn generate(dir: &Path, force: bool, fuzz: bool) -> Result<(ContractInfo, Vec<&'static str>)> {
+/// Prefix used to comment out generated hand-edit-detection markers (#344):
+/// `//` for Rust source, `#` for `fuzz/Cargo.toml`'s TOML syntax.
+fn marker_comment_prefix(rel: &str) -> &'static str {
+    if rel.ends_with(".toml") {
+        "#"
+    } else {
+        "//"
+    }
+}
+
+/// A non-cryptographic content hash, formatted as lowercase hex. Only used to
+/// detect accidental drift between what was generated and what's on disk now
+/// (issue #344) — never a security boundary, so `DefaultHasher` (already in
+/// `std`, no new dependency needed) is sufficient.
+fn content_hash(content: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    content.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// The literal marker line embedded as the first line of every generated file
+/// (issue #344), e.g. `// soroban-forge:hash:1a2b3c4d5e6f7890`.
+fn marker_line(comment_prefix: &str, hash: &str) -> String {
+    format!("{comment_prefix} soroban-forge:hash:{hash}\n")
+}
+
+/// Prepend a hash marker (over `contents` as generated, before the marker
+/// itself is added) to `contents`, keyed to `rel`'s file type.
+fn embed_hash_marker(rel: &str, contents: &str) -> String {
+    let prefix = marker_comment_prefix(rel);
+    let hash = content_hash(contents);
+    format!("{}{}", marker_line(prefix, &hash), contents)
+}
+
+/// If `file_contents`' first line is a marker written by [`embed_hash_marker`],
+/// returns `(stored_hash, remainder)` where `remainder` is everything after
+/// that first line — i.e. what the body was expected to hash to at generation
+/// time. Returns `None` when there is no recognizable marker (e.g. a file that
+/// predates this mechanism, or was created by hand from scratch) — callers
+/// must treat that the same as "hand-edited": there's nothing to compare against.
+fn extract_hash_marker<'a>(rel: &str, file_contents: &'a str) -> Option<(String, &'a str)> {
+    let prefix = marker_comment_prefix(rel);
+    let needle = format!("{prefix} soroban-forge:hash:");
+    let first_line_end = file_contents.find('\n')?;
+    let first_line = &file_contents[..first_line_end];
+    let hash = first_line.strip_prefix(&needle)?;
+    Some((hash.to_string(), &file_contents[first_line_end + 1..]))
+}
+
+/// True when `path`'s current on-disk content no longer matches the hash
+/// marker it was generated with — i.e. a developer hand-edited it since
+/// `test-init` last wrote it (issue #344). A missing/unrecognized marker
+/// (including a missing file) is conservatively treated as "hand-edited":
+/// there is no generation-time hash to trust it against.
+fn was_hand_edited_since_generation(rel: &str, path: &Path) -> bool {
+    let Ok(existing) = std::fs::read_to_string(path) else {
+        return true;
+    };
+    match extract_hash_marker(rel, &existing) {
+        Some((stored_hash, remainder)) => content_hash(remainder) != stored_hash,
+        None => true,
+    }
+}
+
+pub fn generate(
+    dir: &Path,
+    force: bool,
+    fuzz: bool,
+) -> Result<(ContractInfo, Vec<&'static str>, Vec<&'static str>)> {
     generate_with(dir, &GenerateOptions::new(force, fuzz))
 }
 
@@ -1610,7 +1753,7 @@ pub fn generate(dir: &Path, force: bool, fuzz: bool) -> Result<(ContractInfo, Ve
 pub fn generate_with(
     dir: &Path,
     options: &GenerateOptions,
-) -> Result<(ContractInfo, Vec<&'static str>)> {
+) -> Result<(ContractInfo, Vec<&'static str>, Vec<&'static str>)> {
     generate_with_options_layout(dir, options, TestLayout::default())
 }
 
@@ -1623,7 +1766,7 @@ pub fn generate_with_layout(
     layout: TestLayout,
     budget: bool,
     budget_entrypoint: Option<&str>,
-) -> Result<(ContractInfo, Vec<&'static str>)> {
+) -> Result<(ContractInfo, Vec<&'static str>, Vec<&'static str>)> {
     let options = GenerateOptions {
         force,
         fuzz,
@@ -1634,11 +1777,14 @@ pub fn generate_with_layout(
     generate_with_options_layout(dir, &options, layout)
 }
 
+/// Returns `(info, written, skipped)`: `skipped` (#344) lists files whose
+/// on-disk content had drifted from their last-generated hash marker and so
+/// were left alone under `--force` (use `--force-all` to overwrite them too).
 pub fn generate_with_options_layout(
     dir: &Path,
     options: &GenerateOptions,
     layout: TestLayout,
-) -> Result<(ContractInfo, Vec<&'static str>)> {
+) -> Result<(ContractInfo, Vec<&'static str>, Vec<&'static str>)> {
     let info = detect::inspect(dir)?;
 
     let smoke = build_smoke_test(&info);
@@ -1755,22 +1901,69 @@ pub fn generate_with_options_layout(
         files.push(("fuzz/Cargo.toml", render_str(FUZZ_CARGO_TOML, &vars)));
         files.push((
             "fuzz/fuzz_targets/fuzz_target_1.rs",
-            generate_fuzz_target(&info),
+            generate_fuzz_target(&info, options.fuzz_runs, options.fuzz_timeout),
         ));
     }
 
     let mut written = Vec::new();
+    let mut skipped = Vec::new();
     for (rel, contents) in files {
         let path = dir.join(rel);
-        if path.exists() && !options.force {
+        let exists = path.exists();
+        if exists && !options.force && !options.force_all {
             return Err(ForgeError::AlreadyExists(path));
+        }
+        // Issue #344: a file that exists under --force/--force-all might have
+        // been hand-edited since it was last generated. Only --force-all may
+        // clobber it; plain --force leaves it alone and reports it as skipped.
+        if exists && !options.force_all && was_hand_edited_since_generation(rel, &path) {
+            skipped.push(rel);
+            continue;
         }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(ForgeError::io(format!("creating {}", parent.display())))?;
         }
-        std::fs::write(&path, contents)
+        std::fs::write(&path, embed_hash_marker(rel, &contents))
             .map_err(ForgeError::io(format!("writing {}", path.display())))?;
+    // Validate every target before writing any of them (issue #238): a file
+    // whose on-disk content already matches what generation would produce is
+    // left alone rather than rewritten or treated as a conflict — re-running
+    // test-init with unchanged inputs must converge on the same tree, not
+    // fail outright. A file that exists with *different* content (edited by
+    // the user, or stale from a contract that has since changed) still
+    // requires `--force`, and is refused here before anything is written, so
+    // a blocked run never leaves the tree half-updated.
+    let mut plan: Vec<(&'static str, String, bool)> = Vec::with_capacity(files.len());
+    for (rel, contents) in files {
+        let path = dir.join(rel);
+        let needs_write = if path.exists() {
+            let existing = std::fs::read_to_string(&path)
+                .map_err(ForgeError::io(format!("reading {}", path.display())))?;
+            if existing == contents {
+                false
+            } else if options.force {
+                true
+            } else {
+                return Err(ForgeError::AlreadyExists(path));
+            }
+        } else {
+            true
+        };
+        plan.push((rel, contents, needs_write));
+    }
+
+    let mut written = Vec::new();
+    for (rel, contents, needs_write) in plan {
+        if needs_write {
+            let path = dir.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(ForgeError::io(format!("creating {}", parent.display())))?;
+            }
+            std::fs::write(&path, contents)
+                .map_err(ForgeError::io(format!("writing {}", path.display())))?;
+        }
         written.push(rel);
     }
 
@@ -1779,7 +1972,7 @@ pub fn generate_with_options_layout(
         ensure_inline_module_declared(dir)?;
     }
 
-    Ok((info, written))
+    Ok((info, written, skipped))
 }
 
 /// For each of the contract's methods, whether any generated test file
@@ -1995,10 +2188,16 @@ pub fn format_workspace_report(results: &[MemberHarness], fuzz: bool) -> String 
     let mut out = String::from("generated test harnesses for workspace members:\n\n");
     for r in results {
         match &r.outcome {
-            Ok((info, written)) => {
+            Ok((info, written, hand_edited)) => {
                 out.push_str(&format!("  {} (crate `{}`):\n", r.member, info.crate_name));
                 for rel in written {
                     out.push_str(&format!("    {rel}\n"));
+                }
+                if !hand_edited.is_empty() {
+                    out.push_str("    hand-edited since last generation, left alone (pass --force-all to overwrite):\n");
+                    for rel in hand_edited {
+                        out.push_str(&format!("      {rel}\n"));
+                    }
                 }
             }
             Err(reason) => {
@@ -2039,7 +2238,13 @@ impl ForgePlugin for TestgenPlugin {
                 Arg::new("force")
                     .long("force")
                     .action(ArgAction::SetTrue)
-                    .help("Overwrite previously generated files"),
+                    .help("Overwrite previously generated files that have not been hand-edited since generation (pass --force-all to also overwrite hand-edited ones)"),
+            )
+            .arg(
+                Arg::new("force-all")
+                    .long("force-all")
+                    .action(ArgAction::SetTrue)
+                    .help("Like --force, but also overwrites files hand-edited since their last generation"),
             )
             .arg(
                 Arg::new("prop")
@@ -2061,6 +2266,22 @@ impl ForgePlugin for TestgenPlugin {
                     .long("fuzz")
                     .action(ArgAction::SetTrue)
                     .help("Emit a cargo-fuzz target that feeds arbitrary values into the contract methods"),
+            )
+            .arg(
+                Arg::new("fuzz-runs")
+                    .long("fuzz-runs")
+                    .value_name("N")
+                    .value_parser(clap::value_parser!(u32))
+                    .requires("fuzz")
+                    .help("Bound the generated fuzz target's CI invocation to N libFuzzer runs (-runs=N)"),
+            )
+            .arg(
+                Arg::new("fuzz-timeout")
+                    .long("fuzz-timeout")
+                    .value_name("SECS")
+                    .value_parser(clap::value_parser!(u64))
+                    .requires("fuzz")
+                    .help("Bound the generated fuzz target's CI invocation to SECS wall-clock seconds (-max_total_time=SECS)"),
             )
             .arg(
                 Arg::new("coverage")
@@ -2169,6 +2390,9 @@ impl ForgePlugin for TestgenPlugin {
             fail_on_uncovered: matches.get_flag("fail-on-uncovered"),
             localnet: matches.get_flag("localnet"),
             prop_cases: matches.get_one::<u32>("prop-cases").copied().unwrap_or(50),
+            fuzz_runs: matches.get_one::<u32>("fuzz-runs").copied(),
+            fuzz_timeout: matches.get_one::<u64>("fuzz-timeout").copied(),
+            force_all: matches.get_flag("force-all"),
         };
         let fuzz = options.fuzz;
 
@@ -2179,11 +2403,12 @@ impl ForgePlugin for TestgenPlugin {
                 let members: Vec<serde_json::Value> = results
                     .iter()
                     .map(|r| match &r.outcome {
-                        Ok((info, written)) => serde_json::json!({
+                        Ok((info, written, hand_edited)) => serde_json::json!({
                             "member": r.member,
                             "crate_name": info.crate_name,
                             "contract_types": info.contract_types,
                             "written_files": written,
+                            "hand_edited_files": hand_edited,
                             "skipped": false,
                         }),
                         Err(reason) => serde_json::json!({
@@ -2204,7 +2429,7 @@ impl ForgePlugin for TestgenPlugin {
             return Ok(());
         }
 
-        let (info, written) = generate_with_options_layout(&dir, &options, layout)?;
+        let (info, written, hand_edited) = generate_with_options_layout(&dir, &options, layout)?;
 
         // --bench: criterion benchmarks alongside the harness (#235).
         //
@@ -2278,6 +2503,7 @@ impl ForgePlugin for TestgenPlugin {
                 "events_count": info.events.len(),
                 "layout": layout.as_str(),
                 "written_files": written,
+                "hand_edited_files": hand_edited,
                 "entrypoint_coverage": {
                     "covered": covered,
                     "uncovered": uncovered
@@ -2287,6 +2513,14 @@ impl ForgePlugin for TestgenPlugin {
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
         } else if !ctx.quiet {
             print!("{}", format_report_with_layout(&info, &written, fuzz, layout));
+            if !hand_edited.is_empty() {
+                println!(
+                    "\nhand-edited since last generation, left alone (pass --force-all to overwrite):"
+                );
+                for rel in &hand_edited {
+                    println!("  {rel}");
+                }
+            }
             print!("{}", format_coverage_summary(&covered, &uncovered));
         }
 
@@ -2447,7 +2681,7 @@ impl VaultContract {
             ..GenerateOptions::default()
         };
 
-        let (_, written) = generate_with(&dir, &options).unwrap();
+        let (_, written, _) = generate_with(&dir, &options).unwrap();
         assert!(written.contains(&"tests/forge_localnet.rs"));
         let generated = std::fs::read_to_string(dir.join("tests/forge_localnet.rs")).unwrap();
         assert!(generated.contains("deploy_and_invoke_on_localnet"));
@@ -2491,7 +2725,7 @@ impl VaultContract {
         let dir = tmp.path().join("demo");
         hello_world_project(&dir);
 
-        let (info, written) = generate(&dir, false, false).unwrap();
+        let (info, written, _hand_edited) = generate(&dir, false, false).unwrap();
         assert_eq!(info.contract_types, vec!["HelloContract"]);
         assert!(!info.has_constructor);
         assert!(info.has_testutils);
@@ -2501,7 +2735,9 @@ impl VaultContract {
                 "tests/common/mod.rs",
                 "tests/forge_smoke.rs",
                 "tests/forge_invariant.rs",
-                "tests/forge_snapshots.rs"
+                "tests/forge_snapshots.rs",
+                "tests/forge_error_paths.rs",
+                "tests/forge_reentrancy.rs"
             ]
         );
 
@@ -2523,13 +2759,102 @@ impl VaultContract {
         assert!(!snapshot.contains("{{"));
     }
 
+    // ── hand-edit detection (#344) ────────────────────────────────────────────
+
+    /// An unmodified generated file (its content still hashes to the marker
+    /// `test-init` wrote) regenerates silently under `--force`.
+    #[test]
+    fn force_regenerates_unmodified_file_silently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("demo");
+        hello_world_project(&dir);
+
+        let (_, written, hand_edited) = generate(&dir, false, false).unwrap();
+        assert!(written.contains(&"tests/forge_smoke.rs"));
+        assert!(hand_edited.is_empty());
+
+        // Re-run with --force, touching nothing in between.
+        let options = GenerateOptions {
+            force: true,
+            ..GenerateOptions::default()
+        };
+        let (_, written, hand_edited) = generate_with(&dir, &options).unwrap();
+        assert!(
+            written.contains(&"tests/forge_smoke.rs"),
+            "unmodified file must be silently regenerated: {written:?}"
+        );
+        assert!(hand_edited.is_empty(), "nothing should be flagged as hand-edited");
+    }
+
+    /// A file whose content was hand-edited since generation is left alone
+    /// (and reported) under plain `--force`, not clobbered.
+    #[test]
+    fn force_skips_and_reports_a_hand_edited_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("demo");
+        hello_world_project(&dir);
+        generate(&dir, false, false).unwrap();
+
+        let smoke_path = dir.join("tests/forge_smoke.rs");
+        let mut hand_edited_contents = std::fs::read_to_string(&smoke_path).unwrap();
+        hand_edited_contents.push_str("\n// a developer's own addition\n");
+        std::fs::write(&smoke_path, &hand_edited_contents).unwrap();
+
+        let options = GenerateOptions {
+            force: true,
+            ..GenerateOptions::default()
+        };
+        let (_, written, hand_edited) = generate_with(&dir, &options).unwrap();
+
+        assert!(
+            hand_edited.contains(&"tests/forge_smoke.rs"),
+            "hand-edited file must be reported as skipped: {hand_edited:?}"
+        );
+        assert!(!written.contains(&"tests/forge_smoke.rs"));
+
+        // The developer's edit must survive untouched.
+        let on_disk = std::fs::read_to_string(&smoke_path).unwrap();
+        assert_eq!(on_disk, hand_edited_contents);
+    }
+
+    /// `--force-all` overwrites every file, including ones hand-edited since
+    /// their last generation.
+    #[test]
+    fn force_all_overwrites_a_hand_edited_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("demo");
+        hello_world_project(&dir);
+        generate(&dir, false, false).unwrap();
+
+        let smoke_path = dir.join("tests/forge_smoke.rs");
+        let mut hand_edited_contents = std::fs::read_to_string(&smoke_path).unwrap();
+        hand_edited_contents.push_str("\n// a developer's own addition\n");
+        std::fs::write(&smoke_path, &hand_edited_contents).unwrap();
+
+        let options = GenerateOptions {
+            force: true,
+            force_all: true,
+            ..GenerateOptions::default()
+        };
+        let (_, written, hand_edited) = generate_with(&dir, &options).unwrap();
+
+        assert!(hand_edited.is_empty(), "--force-all must overwrite everything: {hand_edited:?}");
+        assert!(written.contains(&"tests/forge_smoke.rs"));
+
+        let on_disk = std::fs::read_to_string(&smoke_path).unwrap();
+        assert!(
+            !on_disk.contains("a developer's own addition"),
+            "--force-all must have discarded the hand edit"
+        );
+    }
+
     #[test]
     fn generates_fuzz_target_for_hello_world() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("demo");
         hello_world_project(&dir);
 
-        let (_info, written) = generate(&dir, false, true).unwrap();
+        let (_info, written, _hand_edited) = generate(&dir, false, true).unwrap();
         assert!(written.contains(&"tests/common/mod.rs"));
         assert!(written.contains(&"tests/forge_smoke.rs"));
         assert!(written.contains(&"tests/forge_invariant.rs"));
@@ -2565,7 +2890,7 @@ impl VaultContract {
         )
         .unwrap();
 
-        let (info, _) = generate(&dir, false, false).unwrap();
+        let (info, _, _) = generate(&dir, false, false).unwrap();
         assert!(info.has_constructor);
         let smoke = std::fs::read_to_string(dir.join("tests/forge_smoke.rs")).unwrap();
         assert!(!smoke.contains("#[ignore]"));
@@ -2580,11 +2905,59 @@ impl VaultContract {
         hello_world_project(&dir);
 
         generate(&dir, false, false).unwrap();
+
+        // A bare re-run with nothing changed converges (#238) rather than
+        // erroring — the conflict this test is about only exists once a
+        // generated file has actually been modified.
+        std::fs::write(
+            dir.join("tests/forge_smoke.rs"),
+            "// hand-edited by the user\n",
+        )
+        .unwrap();
         assert!(matches!(
             generate(&dir, false, false),
             Err(ForgeError::AlreadyExists(_))
         ));
         generate(&dir, true, false).unwrap();
+    }
+
+    #[test]
+    fn rerunning_with_no_changes_converges_on_the_same_tree() {
+        // #238: running test-init twice with nothing changed must produce
+        // the same tree the second time, not error and not accumulate or
+        // alter files.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("demo");
+        hello_world_project(&dir);
+
+        let (_, written_first) = generate(&dir, false, false).unwrap();
+        let snapshot_before: Vec<(String, String)> = written_first
+            .iter()
+            .map(|rel| {
+                (
+                    (*rel).to_string(),
+                    std::fs::read_to_string(dir.join(rel)).unwrap(),
+                )
+            })
+            .collect();
+
+        let (_, written_second) = generate(&dir, false, false)
+            .expect("re-running with unchanged inputs must not fail");
+        assert_eq!(written_first, written_second, "same set of files, same order");
+
+        let snapshot_after: Vec<(String, String)> = written_second
+            .iter()
+            .map(|rel| {
+                (
+                    (*rel).to_string(),
+                    std::fs::read_to_string(dir.join(rel)).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            snapshot_before, snapshot_after,
+            "re-running test-init with nothing changed must not alter any file"
+        );
     }
 
     #[test]
@@ -2696,7 +3069,7 @@ impl VaultContract {
             name: "mint".into(),
             args: vec![("amount".into(), "i128".into())],
         }];
-        let fuzz = generate_fuzz_target(&info);
+        let fuzz = generate_fuzz_target(&info, None, None);
 
         // First contract only.
         assert!(fuzz.contains("use demo::{Foo, FooClient};"));
@@ -2713,11 +3086,37 @@ impl VaultContract {
     fn fuzz_target_emits_constructor_prototype() {
         let mut info = contract_info(true, true);
         info.constructor_arg_types = Some(vec![("admin".into(), "Address".into())]);
-        let fuzz = generate_fuzz_target(&info);
+        let fuzz = generate_fuzz_target(&info, None, None);
 
         assert!(fuzz.contains("pub struct FuzzConstructorArgs"));
         assert!(fuzz.contains("admin: <Address as SorobanArbitrary>::Prototype"));
         assert!(fuzz.contains("fuzz_target!(|input: (FuzzConstructorArgs, FuzzInput)|"));
+    }
+
+    /// Issue #342: `--fuzz-runs` / `--fuzz-timeout` must be reflected in the
+    /// generated fuzz target's header comment as a bounded CI invocation.
+    #[test]
+    fn fuzz_target_header_reflects_runs_and_timeout_bounds() {
+        let info = multi_contract_info(false, true);
+
+        let unbounded = generate_fuzz_target(&info, None, None);
+        assert!(unbounded.contains("cargo +nightly fuzz run fuzz_target_1\n"));
+        assert!(!unbounded.contains("-runs="));
+        assert!(!unbounded.contains("-max_total_time="));
+
+        let runs_only = generate_fuzz_target(&info, Some(1000), None);
+        assert!(runs_only.contains("cargo +nightly fuzz run fuzz_target_1 -- -runs=1000"));
+
+        let timeout_only = generate_fuzz_target(&info, None, Some(60));
+        assert!(timeout_only.contains("cargo +nightly fuzz run fuzz_target_1 -- -max_total_time=60"));
+
+        let both = generate_fuzz_target(&info, Some(1000), Some(60));
+        assert!(both.contains("cargo +nightly fuzz run fuzz_target_1 -- -runs=1000 -max_total_time=60"));
+    }
+
+    #[test]
+    fn fuzz_run_command_defaults_to_unbounded() {
+        assert_eq!(fuzz_run_command(None, None), "cargo +nightly fuzz run fuzz_target_1");
     }
 
     #[test]
@@ -2764,7 +3163,7 @@ soroban-sdk = { version = "1", features = ["testutils"] }
         )
         .unwrap();
 
-        let (info, written) = generate(&dir, false, false).unwrap();
+        let (info, written, _hand_edited) = generate(&dir, false, false).unwrap();
         assert_eq!(info.contract_types, vec!["FirstContract", "SecondContract"]);
         assert_eq!(
             written,
@@ -2772,7 +3171,9 @@ soroban-sdk = { version = "1", features = ["testutils"] }
                 "tests/common/mod.rs",
                 "tests/forge_smoke.rs",
                 "tests/forge_invariant.rs",
-                "tests/forge_snapshots.rs"
+                "tests/forge_snapshots.rs",
+                "tests/forge_error_paths.rs",
+                "tests/forge_reentrancy.rs"
             ]
         );
 
@@ -2950,7 +3351,7 @@ impl TokenContract {
         )
         .unwrap();
 
-        let (info, written) = generate(&dir, false, false).unwrap();
+        let (info, written, _hand_edited) = generate(&dir, false, false).unwrap();
         assert_eq!(info.contract_types, vec!["TokenContract"]);
         assert_eq!(info.events.len(), 2);
         assert!(written.contains(&"tests/forge_events.rs"));
@@ -3004,7 +3405,7 @@ impl HelloContract {
         )
         .unwrap();
 
-        let (_info, written) = generate(&dir, false, false).unwrap();
+        let (_info, written, _hand_edited) = generate(&dir, false, false).unwrap();
         assert!(!written.contains(&"tests/forge_events.rs"));
     }
 
@@ -3066,7 +3467,7 @@ impl HelloContract {
         let dir = tmp.path().join("vault");
         persistent_storage_project(&dir);
 
-        let (info, written) = generate(&dir, false, false).unwrap();
+        let (info, written, _hand_edited) = generate(&dir, false, false).unwrap();
         assert!(info.has_persistent_storage);
         assert!(written.contains(&"tests/forge_ttl.rs"), "{written:?}");
 
@@ -3087,7 +3488,7 @@ impl HelloContract {
         let dir = tmp.path().join("demo");
         hello_world_project(&dir);
 
-        let (info, written) = generate(&dir, false, false).unwrap();
+        let (info, written, _hand_edited) = generate(&dir, false, false).unwrap();
         assert!(!info.has_persistent_storage);
         assert!(!written.contains(&"tests/forge_ttl.rs"));
     }
@@ -3118,7 +3519,7 @@ impl HelloContract {
         let dir = tmp.path().join("demo");
         hello_world_project(&dir);
 
-        let (_info, written) =
+        let (_info, written, _hand_edited) =
             generate_with_layout(&dir, true, false, TestLayout::Inline, false, None).unwrap();
         assert_eq!(written, vec!["src/forge_tests.rs"]);
         assert!(!dir.join("tests/forge_smoke.rs").exists());
@@ -3180,7 +3581,7 @@ impl HelloContract {
         let dir = tmp.path().join("demo");
         hello_world_project(&dir);
 
-        let (_info, written) = generate(&dir, true, false).unwrap();
+        let (_info, written, _hand_edited) = generate(&dir, true, false).unwrap();
         assert!(written.contains(&"tests/forge_smoke.rs"));
         assert!(!written.contains(&"src/forge_tests.rs"));
         let lib = std::fs::read_to_string(dir.join("src/lib.rs")).unwrap();
@@ -3313,7 +3714,7 @@ impl HelloContract {
         let dir = tmp.path().join("proj");
         hello_world_project(&dir);
 
-        let (_info, written) = generate(&dir, false, false).unwrap();
+        let (_info, written, _hand_edited) = generate(&dir, false, false).unwrap();
         assert!(!written.contains(&"tests/forge_budget.rs"), "{written:?}");
 
         let options = GenerateOptions {
@@ -3321,7 +3722,7 @@ impl HelloContract {
             budget: true,
             ..GenerateOptions::default()
         };
-        let (_info, written) = generate_with(&dir, &options).unwrap();
+        let (_info, written, _hand_edited) = generate_with(&dir, &options).unwrap();
         assert!(written.contains(&"tests/forge_budget.rs"), "{written:?}");
         let body = std::fs::read_to_string(dir.join("tests/forge_budget.rs")).unwrap();
         assert!(body.contains("cost_estimate"), "{body}");
@@ -3381,7 +3782,7 @@ impl DemoContract {
         )
         .unwrap();
 
-        let (info, written) = generate(dir.path(), false, false).unwrap();
+        let (info, written, _hand_edited) = generate(dir.path(), false, false).unwrap();
         assert_eq!(
             info.init_method.map(|m| m.name).as_deref(),
             Some("initialize")
@@ -3397,7 +3798,7 @@ impl DemoContract {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
         hello_world_project(&dir);
-        let (_info, written) = generate(&dir, false, false).unwrap();
+        let (_info, written, _hand_edited) = generate(&dir, false, false).unwrap();
         assert!(
             !written.contains(&"tests/forge_init_once.rs"),
             "{written:?}"
