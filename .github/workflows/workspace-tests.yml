@@ -1,0 +1,36 @@
+# Builds soroban-forge's own workspace crates and runs the testgen crate's
+# test suite. Distinct from scaffold-templates.yml / nightly-soroban-sdk.yml,
+# which exercise *generated* projects — this is the only workflow that would
+# catch a compile error or regression in the tool's own source (issue #343:
+# `main` had a syntax error in crates/core and 2 stale testgen assertions,
+# with nothing in CI to catch either).
+#
+# `cargo test --workspace` is intentionally not run here yet: soroban-forge-core's
+# own test suite currently fails to compile independently of this issue (a
+# `#[cfg(test)]`-only `soroban_forge_optimize` import with no matching
+# dev-dependency) — out of scope for #343, tracked separately.
+name: workspace-tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: build workspace, test testgen
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: wasm32v1-none
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: cargo build --workspace
+        run: cargo build --workspace
+      - name: cargo test -p soroban-forge-testgen
+        run: cargo test -p soroban-forge-testgen
