@@ -33,6 +33,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   entrypoints taking `Option`, `Vec` or `Map` arguments, passing empty,
   single- and multi-element values through each — container arguments are
   frequently mis-encoded, the empty case most of all (#236)
+- `soroban-forge doctor` now reports a `Cargo.lock` check for the current
+  project, warning when the lockfile is missing or present but excluded by
+  `.gitignore`. Either way version control does not carry it, so CI resolves
+  fresh dependency versions on every build instead of reproducing the set the
+  contract was tested against. A lockfile that is already tracked is reported
+  as fine even when an ignore rule matches it, since git carries it regardless
 
 ### Changed
 - `test-init --bench` is no longer an alias for `--budget`. It now emits
