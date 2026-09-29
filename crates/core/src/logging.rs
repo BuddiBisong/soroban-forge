@@ -98,7 +98,10 @@ pub fn init_with_color(verbose: u8, log_file: Option<&Path>, use_color: bool) ->
         .map(|path| {
             File::create(path)
                 .map(Mutex::new)
-                .map_err(ForgeError::io(format!("creating log file {}", path.display())))
+                .map_err(ForgeError::io(format!(
+                    "creating log file {}",
+                    path.display()
+                )))
         })
         .transpose()?;
 

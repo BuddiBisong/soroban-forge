@@ -10,6 +10,7 @@
 //! - `git` (recommended, not required), and its `user.name`/`user.email`
 //!   identity, without which the first commit in a new project fails
 //! - Docker (optional, used for reproducible wasm builds)
+//! - free disk space (optional warning when below 1 GiB, since wasm/target builds can be large)
 //! - when run inside a contract project: the project's `soroban-sdk`
 //!   version, compared against the version pinned into new projects
 //!   (`soroban_forge_scaffold::SOROBAN_SDK_VERSION`)
@@ -37,6 +38,9 @@ pub use soroban_forge_core::toolchain::{parse_semverish, version_at_least};
 
 /// Default Soroban RPC endpoint used for the connectivity check.
 pub const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
+
+/// Minimum recommended free disk space (in bytes) for building Soroban contracts and target artifacts (1 GiB).
+pub const MIN_FREE_DISK_SPACE_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
 
 /// Outcome of a single environment check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -424,6 +428,160 @@ pub fn git_identity_check() -> Check {
     classify_git_identity(name.as_deref(), email.as_deref())
 }
 
+/// Format a byte count into a human-readable string (e.g. `1.2 GB`, `500.0 MB`).
+pub fn format_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * KB;
+    const GB: f64 = 1024.0 * MB;
+    const TB: f64 = 1024.0 * GB;
+
+    let b = bytes as f64;
+    if b >= TB {
+        format!("{:.1} TB", b / TB)
+    } else if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.1} KB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Query available disk space (in bytes) for the filesystem containing `path`.
+#[cfg(windows)]
+pub fn available_disk_space(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut target_dir = path;
+    while !target_dir.exists() {
+        if let Some(parent) = target_dir.parent() {
+            if parent.as_os_str().is_empty() {
+                target_dir = Path::new(".");
+                break;
+            }
+            target_dir = parent;
+        } else {
+            target_dir = Path::new(".");
+            break;
+        }
+    }
+
+    let mut wide: Vec<u16> = target_dir.as_os_str().encode_wide().collect();
+    wide.push(0);
+
+    let mut free_bytes: u64 = 0;
+    let mut total_bytes: u64 = 0;
+    let mut total_free_bytes: u64 = 0;
+
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            lpDirectoryName: *const u16,
+            lpFreeBytesAvailableToCaller: *mut u64,
+            lpTotalNumberOfBytes: *mut u64,
+            lpTotalNumberOfFreeBytes: *mut u64,
+        ) -> i32;
+    }
+
+    let ret = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_bytes,
+            &mut total_bytes,
+            &mut total_free_bytes,
+        )
+    };
+
+    if ret != 0 {
+        Some(free_bytes)
+    } else {
+        None
+    }
+}
+
+/// Query available disk space (in bytes) for the filesystem containing `path`.
+#[cfg(unix)]
+pub fn available_disk_space(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut target_dir = path;
+    while !target_dir.exists() {
+        if let Some(parent) = target_dir.parent() {
+            if parent.as_os_str().is_empty() {
+                target_dir = Path::new(".");
+                break;
+            }
+            target_dir = parent;
+        } else {
+            target_dir = Path::new(".");
+            break;
+        }
+    }
+
+    let c_path = CString::new(target_dir.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if ret == 0 {
+        let block_size = if stat.f_frsize > 0 {
+            stat.f_frsize as u64
+        } else {
+            stat.f_bsize as u64
+        };
+        Some(stat.f_bavail as u64 * block_size)
+    } else {
+        None
+    }
+}
+
+/// Query available disk space (in bytes) for the filesystem containing `path`.
+#[cfg(not(any(windows, unix)))]
+pub fn available_disk_space(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// Classify an available disk space probe into a report line.
+///
+/// Wasm and target builds can consume significant disk space. Low disk space is a
+/// [`Status::Warn`], never a [`Status::Fail`].
+pub fn classify_disk_space(available_bytes: Option<u64>, threshold_bytes: u64) -> Check {
+    match available_bytes {
+        Some(bytes) if bytes >= threshold_bytes => Check {
+            name: "disk space",
+            status: Status::Pass,
+            detail: format!("{} free", format_bytes(bytes)),
+            fix: None,
+        },
+        Some(bytes) => Check {
+            name: "disk space",
+            status: Status::Warn,
+            detail: format!(
+                "{} free (low; recommended >= {} for wasm/target builds)",
+                format_bytes(bytes),
+                format_bytes(threshold_bytes)
+            ),
+            fix: Some(
+                "free up disk space on the active drive (target and wasm builds can be large)",
+            ),
+        },
+        None => Check {
+            name: "disk space",
+            status: Status::Warn,
+            detail: "could not determine available disk space".into(),
+            fix: Some("verify filesystem permissions or check disk space manually"),
+        },
+    }
+}
+
+/// Report available disk space for `path` against [`MIN_FREE_DISK_SPACE_BYTES`].
+///
+/// Thin system-touching wrapper around [`classify_disk_space`].
+pub fn disk_space_check(path: &Path) -> Check {
+    let available = available_disk_space(path);
+    classify_disk_space(available, MIN_FREE_DISK_SPACE_BYTES)
+}
+
 /// Check whether `url` is reachable with an HTTP GET, returning latency in ms.
 ///
 /// Uses `curl` as a subprocess to avoid pulling in an HTTP client dependency.
@@ -708,42 +866,6 @@ pub fn wasm_build_check(project_dir: &Path) -> Option<Check> {
             fix: Some("install Rust: https://rustup.rs"),
         },
     })
-}
-
-/// Warn when `Cargo.toml` has been changed since the lockfile was updated.
-///
-/// A missing lockfile is checked separately: the project is not stale, it just
-/// doesn't have a lockfile to compare yet. This keeps the warning focused and
-/// avoids double-reporting the same issue.
-pub fn cargo_lock_check(project_dir: &Path) -> Option<Check> {
-    let cargo_toml = project_dir.join("Cargo.toml");
-    if !cargo_toml.is_file() {
-        return None;
-    }
-
-    let cargo_lock = project_dir.join("Cargo.lock");
-    if !cargo_lock.is_file() {
-        return Some(Check {
-            name: "Cargo.lock",
-            status: Status::Warn,
-            detail: "missing; run cargo check to generate it".into(),
-            fix: Some("run cargo check to generate Cargo.lock"),
-        });
-    }
-
-    let toml_mtime = std::fs::metadata(cargo_toml).ok()?.modified().ok()?;
-    let lock_mtime = std::fs::metadata(cargo_lock).ok()?.modified().ok()?;
-    if toml_mtime > lock_mtime {
-        Some(Check {
-            name: "Cargo.lock",
-            status: Status::Warn,
-            detail: "Cargo.toml is newer than Cargo.lock; run cargo update -w or cargo check"
-                .into(),
-            fix: Some("run cargo update -w (or cargo check) to refresh Cargo.lock"),
-        })
-    } else {
-        None
-    }
 }
 
 /// Run all environment checks.
@@ -1152,6 +1274,7 @@ fn list_check_names() -> Vec<&'static str> {
         "release-opt-level",
         "release-lto",
         "release-codegen-units",
+        "disk-space",
     ]
 }
 
@@ -1167,6 +1290,7 @@ impl DoctorPlugin {
     /// than the rest of the report.
     fn gather_checks(&self, ctx: &ForgeContext, do_build: bool) -> Vec<Check> {
         let mut checks = Vec::new();
+        checks.push(disk_space_check(&ctx.cwd));
         if ctx.offline {
             checks.push(Check {
                 name: "testnet RPC",
@@ -1185,15 +1309,12 @@ impl DoctorPlugin {
         if let Some(check) = sdk_version_check(&ctx.cwd) {
             checks.push(check);
         }
+        // A committed lockfile, without which CI cannot reproduce a build.
         if let Some(check) = cargo_lock_check(&ctx.cwd) {
             checks.push(check);
         }
         // Release profile size-optimisation checks (issue #48).
         checks.extend(release_profile_checks(&ctx.cwd));
-        // A committed lockfile, without which CI cannot reproduce a build.
-        if let Some(check) = cargo_lock_check(&ctx.cwd) {
-            checks.push(check);
-        }
         if do_build {
             if let Some(check) = wasm_build_check(&ctx.cwd) {
                 checks.push(check);
@@ -1719,7 +1840,7 @@ mod tests {
     fn docker_absent_warns_without_failing() {
         let check = classify_docker(None, false);
         assert_eq!(check.status, Status::Warn);
-        assert_eq!(failure_count(&[check.clone()]), 0);
+        assert_eq!(failure_count(std::slice::from_ref(&check)), 0);
         assert!(check.detail.contains("not found"));
         assert!(check.fix.unwrap().contains("docs.docker.com"));
     }
@@ -1870,8 +1991,8 @@ mod tests {
     }
 
     #[test]
-    fn docker_and_git_identity_are_not_auto_fixable() {
-        for name in ["docker", "git identity"] {
+    fn docker_and_git_identity_and_disk_space_are_not_auto_fixable() {
+        for name in ["docker", "git identity", "disk space"] {
             assert!(remedy(&fail(name)).is_none(), "{name}");
         }
     }
@@ -1896,6 +2017,26 @@ mod tests {
     fn lockfile_present_and_not_ignored_passes() {
         let check = classify_cargo_lock(true, LockIgnored::No);
         assert_eq!(check.status, Status::Pass);
+    // ---- disk space check ----
+
+    #[test]
+    fn format_bytes_formats_correct_units() {
+        assert_eq!(format_bytes(500), "500 B");
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(1536), "1.5 KB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(format_bytes(500 * 1024 * 1024), "500.0 MB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GB");
+        assert_eq!(format_bytes(50 * 1024 * 1024 * 1024), "50.0 GB");
+        assert_eq!(format_bytes(2 * 1024 * 1024 * 1024 * 1024), "2.0 TB");
+    }
+
+    #[test]
+    fn disk_space_reports_pass_when_above_threshold() {
+        let check = classify_disk_space(Some(10 * 1024 * 1024 * 1024), MIN_FREE_DISK_SPACE_BYTES);
+        assert_eq!(check.status, Status::Pass);
+        assert_eq!(check.name, "disk space");
+        assert!(check.detail.contains("10.0 GB free"));
         assert!(check.fix.is_none());
     }
 
@@ -1905,6 +2046,11 @@ mod tests {
         // suggests version control would drop it.
         let check = classify_cargo_lock(true, LockIgnored::Unknown);
         assert_eq!(check.status, Status::Pass);
+    fn disk_space_reports_pass_at_exact_threshold() {
+        let check = classify_disk_space(Some(MIN_FREE_DISK_SPACE_BYTES), MIN_FREE_DISK_SPACE_BYTES);
+        assert_eq!(check.status, Status::Pass);
+        assert_eq!(check.name, "disk space");
+        assert!(check.detail.contains("1.0 GB free"));
         assert!(check.fix.is_none());
     }
 
@@ -1983,6 +2129,35 @@ mod tests {
         // `cargo generate-lockfile` is safe to run, but committing the result
         // is the user's call — so this is reported, never auto-fixed.
         assert!(remedy(&fail("Cargo.lock")).is_none());
+    fn disk_space_reports_warn_when_below_threshold() {
+        let check = classify_disk_space(Some(500 * 1024 * 1024), MIN_FREE_DISK_SPACE_BYTES);
+        assert_eq!(check.status, Status::Warn);
+        assert_eq!(check.name, "disk space");
+        assert!(check.detail.contains("500.0 MB free (low;"));
+        assert!(check.fix.unwrap().contains("free up disk space"));
+    }
+
+    #[test]
+    fn disk_space_reports_warn_at_zero() {
+        let check = classify_disk_space(Some(0), MIN_FREE_DISK_SPACE_BYTES);
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("0 B free (low;"));
+    }
+
+    #[test]
+    fn disk_space_warns_when_available_is_none() {
+        let check = classify_disk_space(None, MIN_FREE_DISK_SPACE_BYTES);
+        assert_eq!(check.status, Status::Warn);
+        assert_eq!(check.name, "disk space");
+        assert!(check.detail.contains("could not determine"));
+        assert!(check.fix.is_some());
+    }
+
+    #[test]
+    fn disk_space_live_check_runs() {
+        let check = disk_space_check(Path::new("."));
+        assert_eq!(check.name, "disk space");
+        assert!(matches!(check.status, Status::Pass | Status::Warn));
     }
 
     // ---- auto-fix (`--fix`) ----

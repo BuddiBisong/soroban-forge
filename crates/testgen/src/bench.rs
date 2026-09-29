@@ -224,7 +224,10 @@ mod tests {
 
     #[test]
     fn defaults_entrypoint_arguments() {
-        let info = info_with(vec![method("mint", &[("to", "Address"), ("amount", "i128")])]);
+        let info = info_with(vec![method(
+            "mint",
+            &[("to", "Address"), ("amount", "i128")],
+        )]);
         let rendered = build_bench(&info);
         assert!(rendered.contains("client.mint(&common::new_account(&env), &0_i128)"));
     }

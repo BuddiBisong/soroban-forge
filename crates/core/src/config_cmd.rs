@@ -83,7 +83,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let plugin = ConfigPlugin;
         let matches = plugin.command().get_matches_from(["config"]);
-        plugin.run(&matches, &ctx_in(dir.path(), false, false)).unwrap();
+        plugin
+            .run(&matches, &ctx_in(dir.path(), false, false))
+            .unwrap();
     }
 
     #[test]
@@ -96,7 +98,9 @@ mod tests {
         .unwrap();
         let plugin = ConfigPlugin;
         let matches = plugin.command().get_matches_from(["config"]);
-        plugin.run(&matches, &ctx_in(dir.path(), false, false)).unwrap();
+        plugin
+            .run(&matches, &ctx_in(dir.path(), false, false))
+            .unwrap();
     }
 
     #[test]
@@ -111,8 +115,12 @@ mod tests {
         std::fs::write(dir.path().join(CONFIG_FILE_NAME), "[scafold]\n").unwrap();
         let plugin = ConfigPlugin;
         let matches = plugin.command().get_matches_from(["config"]);
-        plugin.run(&matches, &ctx_in(dir.path(), true, false)).unwrap();
+        plugin
+            .run(&matches, &ctx_in(dir.path(), true, false))
+            .unwrap();
         let matches = plugin.command().get_matches_from(["config"]);
-        plugin.run(&matches, &ctx_in(dir.path(), false, true)).unwrap();
+        plugin
+            .run(&matches, &ctx_in(dir.path(), false, true))
+            .unwrap();
     }
 }
