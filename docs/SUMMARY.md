@@ -6,6 +6,7 @@
 - [Quickstart](quickstart.md)
 - [Zero to Deployed Testnet Tutorial](tutorial-zero-to-testnet.md)
 - [Architecture](architecture.md)
+- [Architecture decision records](adr/README.md)
 - [Configuration](configuration.md)
 - [Plugins](plugins.md)
   - [Writing a soroban-forge plugin](plugin-tutorial.md)
