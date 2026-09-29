@@ -143,9 +143,16 @@ fn path_str(path: &Path) -> Result<&str> {
 /// Never reimplemented locally.
 ///
 /// Thin system-touching wrapper; not unit-tested.
-fn run_stellar_build(dir: &Path) -> Result<()> {
+pub fn build_stellar_build_args(build_args: &[String]) -> Vec<String> {
+    let mut args = vec!["contract".to_string(), "build".to_string()];
+    args.extend(build_args.iter().cloned());
+    args
+}
+
+fn run_stellar_build(dir: &Path, build_args: &[String]) -> Result<()> {
+    let args = build_stellar_build_args(build_args);
     let result = std::process::Command::new("stellar")
-        .args(["contract", "build"])
+        .args(&args)
         .current_dir(dir)
         .output();
 
@@ -168,6 +175,14 @@ fn run_stellar_build(dir: &Path) -> Result<()> {
 /// release build of the cargo project in `dir` — building it first with
 /// `stellar contract build` if it is not there yet.
 pub fn build_if_needed(dir: &Path, wasm_override: Option<&Path>) -> Result<PathBuf> {
+    build_if_needed_with_args(dir, wasm_override, &[])
+}
+
+fn build_if_needed_with_args(
+    dir: &Path,
+    wasm_override: Option<&Path>,
+    build_args: &[String],
+) -> Result<PathBuf> {
     if let Some(path) = wasm_override {
         return Ok(path.to_path_buf());
     }
@@ -175,7 +190,7 @@ pub fn build_if_needed(dir: &Path, wasm_override: Option<&Path>) -> Result<PathB
     let crate_name = read_crate_name(dir)?;
     let wasm_path = locate_wasm(dir, &crate_name);
     if !wasm_path.is_file() {
-        run_stellar_build(dir)?;
+        run_stellar_build(dir, build_args)?;
     }
     if !wasm_path.is_file() {
         return Err(ForgeError::Other(format!(
@@ -188,6 +203,17 @@ pub fn build_if_needed(dir: &Path, wasm_override: Option<&Path>) -> Result<PathB
 
 /// Assemble the full `stellar contract deploy` argument list.
 pub fn build_deploy_args(wasm: &Path, source: &str, network: &NetworkArgs) -> Result<Vec<String>> {
+    build_deploy_args_with_alias(wasm, source, network, None)
+}
+
+/// Assemble the deploy command, optionally registering a stellar-cli alias
+/// for the resulting contract ID.
+pub fn build_deploy_args_with_alias(
+    wasm: &Path,
+    source: &str,
+    network: &NetworkArgs,
+    alias: Option<&str>,
+) -> Result<Vec<String>> {
     let wasm_str = path_str(wasm)?.to_string();
     let mut args = vec![
         "contract".to_string(),
@@ -197,6 +223,10 @@ pub fn build_deploy_args(wasm: &Path, source: &str, network: &NetworkArgs) -> Re
         "--source".to_string(),
         source.to_string(),
     ];
+    if let Some(alias) = alias {
+        args.push("--alias".to_string());
+        args.push(alias.to_string());
+    }
     args.extend(network.cli_args());
     Ok(args)
 }
@@ -210,8 +240,9 @@ fn run_stellar_deploy(
     source: &str,
     network: &NetworkArgs,
     timeout: Option<Duration>,
+    alias: Option<&str>,
 ) -> Result<String> {
-    let args = build_deploy_args(wasm, source, network)?;
+    let args = build_deploy_args_with_alias(wasm, source, network, alias)?;
     log::debug!("deploying {}", wasm.display());
 
     let result = soroban_forge_core::timeout::output_with_timeout(
@@ -262,8 +293,20 @@ pub fn deploy(
     network: &NetworkArgs,
     timeout: Option<Duration>,
 ) -> Result<String> {
-    let wasm_path = build_if_needed(dir, wasm_override)?;
-    run_stellar_deploy(&wasm_path, source, network, timeout)
+    deploy_with_options(dir, wasm_override, source, network, timeout, &[], None)
+}
+
+fn deploy_with_options(
+    dir: &Path,
+    wasm_override: Option<&Path>,
+    source: &str,
+    network: &NetworkArgs,
+    timeout: Option<Duration>,
+    build_args: &[String],
+    alias: Option<&str>,
+) -> Result<String> {
+    let wasm_path = build_if_needed_with_args(dir, wasm_override, build_args)?;
+    run_stellar_deploy(&wasm_path, source, network, timeout, alias)
 }
 
 /// Names of arguments that may contain secret material and must be redacted
@@ -560,6 +603,20 @@ impl ForgePlugin for DeployPlugin {
                     .action(clap::ArgAction::SetTrue)
                     .help("Automatically fund an unfunded testnet source account via friendbot before deploying"),
             )
+            .arg(
+                Arg::new("build-arg")
+                    .long("build-arg")
+                    .value_name("ARG")
+                    .action(clap::ArgAction::Append)
+                    .allow_hyphen_values(true)
+                    .help("Forward one argument to stellar contract build (repeatable, e.g. --build-arg=--features)"),
+            )
+            .arg(
+                Arg::new("alias")
+                    .long("alias")
+                    .value_name("NAME")
+                    .help("Register the deployed contract under this stellar-cli alias"),
+            )
     }
 
     fn run(&self, matches: &ArgMatches, ctx: &ForgeContext) -> Result<()> {
@@ -582,6 +639,12 @@ impl ForgePlugin for DeployPlugin {
         let source = matches
             .get_one::<String>("source")
             .expect("source is required by clap");
+        let build_args: Vec<String> = matches
+            .get_many::<String>("build-arg")
+            .unwrap_or_default()
+            .cloned()
+            .collect();
+        let alias = matches.get_one::<String>("alias").map(String::as_str);
 
         let network = NetworkArgs::resolve(
             matches.get_one::<String>("network").cloned(),
@@ -594,8 +657,8 @@ impl ForgePlugin for DeployPlugin {
         }
 
         if dry_run {
-            let wasm_path = build_if_needed(&dir, wasm_override.as_deref())?;
-            let args = build_deploy_args(&wasm_path, source, &network)?;
+            let wasm_path = build_if_needed_with_args(&dir, wasm_override.as_deref(), &build_args)?;
+            let args = build_deploy_args_with_alias(&wasm_path, source, &network, alias)?;
             let command_line = format_dry_run_command("stellar", &args);
             if ctx.json {
                 let report = serde_json::json!({ "command": command_line });
@@ -606,17 +669,29 @@ impl ForgePlugin for DeployPlugin {
             return Ok(());
         }
 
-        let contract_id = deploy(&dir, wasm_override.as_deref(), source, &network, ctx.timeout())?;
+        let contract_id = deploy_with_options(
+            &dir,
+            wasm_override.as_deref(),
+            source,
+            &network,
+            ctx.timeout(),
+            &build_args,
+            alias,
+        )?;
 
         if ctx.json {
             let report = serde_json::json!({
                 "contract_id": contract_id,
                 "network": network.label(),
+                "alias": alias,
             });
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
         } else if !ctx.quiet {
             println!("deployed to {}", network.label());
             println!("contract ID: {contract_id}");
+            if let Some(alias) = alias {
+                println!("alias: {alias}");
+            }
         } else {
             println!("{contract_id}");
         }
@@ -749,6 +824,30 @@ mod tests {
     }
 
     #[test]
+    fn build_flags_are_forwarded_to_stellar_contract_build() {
+        let args = build_stellar_build_args(&[
+            "--features".to_string(),
+            "experimental".to_string(),
+            "--profile".to_string(),
+            "release".to_string(),
+        ]);
+        assert_eq!(
+            args.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["contract", "build", "--features", "experimental", "--profile", "release"]
+        );
+    }
+
+    #[test]
+    fn deploy_alias_is_forwarded_to_stellar_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wasm = tmp.path().join("my_contract.wasm");
+        std::fs::write(&wasm, b"\0asm").unwrap();
+        let network = NetworkArgs::resolve(None, None, None);
+        let args = build_deploy_args_with_alias(&wasm, "alice", &network, Some("my_token")).unwrap();
+        assert!(args.windows(2).any(|pair| pair[0] == "--alias" && pair[1] == "my_token"));
+    }
+
+    #[test]
     fn format_dry_run_redacts_source_value() {
         let args = vec![
             "contract".to_string(),
@@ -791,6 +890,13 @@ mod tests {
     fn help_documents_fund_flag() {
         let help = DeployPlugin.command().render_long_help().to_string();
         assert!(help.contains("--fund"), "{help}");
+    }
+
+    #[test]
+    fn help_documents_build_args_and_alias() {
+        let help = DeployPlugin.command().render_long_help().to_string();
+        assert!(help.contains("--build-arg"), "{help}");
+        assert!(help.contains("--alias"), "{help}");
     }
 
     #[test]
