@@ -509,6 +509,21 @@ pub fn json_report(report: &VerifyReport) -> String {
     serde_json::to_string_pretty(report).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
 }
 
+/// Human-readable reports for a batch verification, one verdict per contract.
+pub fn format_reports(reports: &[VerifyReport]) -> String {
+    reports.iter().map(format_report).collect()
+}
+
+/// JSON batch output. A batch is always represented as an array so scripts can
+/// handle one and many contract IDs with the same decoder.
+pub fn json_reports(reports: &[VerifyReport]) -> String {
+    serde_json::to_string_pretty(reports).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+}
+
+fn reports_match(reports: &[VerifyReport]) -> bool {
+    reports.iter().all(|report| report.matches)
+}
+
 /// The mismatch error returned to the CLI core, which turns it into exit
 /// code `1`.
 pub fn mismatch_error(report: &VerifyReport) -> ForgeError {
@@ -630,6 +645,28 @@ pub fn verify(
     reproducible: bool,
     timeout: Option<Duration>,
 ) -> Result<VerifyReport> {
+    verify_with_keep_fetched(
+        contract_id,
+        contract_dir,
+        wasm_override,
+        network,
+        reproducible,
+        timeout,
+        None,
+    )
+}
+
+/// Verify a contract and optionally retain the fetched on-chain wasm after
+/// this command's temporary workspace is cleaned up.
+pub fn verify_with_keep_fetched(
+    contract_id: &str,
+    contract_dir: &Path,
+    wasm_override: Option<&Path>,
+    network: &NetworkArgs,
+    reproducible: bool,
+    timeout: Option<Duration>,
+    keep_fetched: Option<&Path>,
+) -> Result<VerifyReport> {
     validate_contract_id(contract_id)?;
 
     let local_wasm = if reproducible {
@@ -642,6 +679,9 @@ pub fn verify(
     let scratch = tempfile::tempdir().map_err(ForgeError::io("creating a temporary directory"))?;
     let fetched = scratch.path().join("onchain.wasm");
     fetch_onchain_wasm(contract_id, network, &fetched, timeout)?;
+    if let Some(destination) = keep_fetched {
+        copy_fetched_wasm(&fetched, destination)?;
+    }
     let onchain_hash = hash_wasm_file(&fetched)?;
 
     let report = VerifyReport::new(
@@ -658,6 +698,15 @@ pub fn verify(
     // network round-trip.
     let diff = spec_diff_for(&fetched, &local_wasm);
     Ok(report.with_spec_diff(diff))
+}
+
+/// Copy the fetched artifact before its temporary directory is dropped.
+fn copy_fetched_wasm(fetched: &Path, destination: &Path) -> Result<()> {
+    std::fs::copy(fetched, destination).map_err(ForgeError::io(format!(
+        "copying fetched wasm to {}",
+        destination.display()
+    )))?;
+    Ok(())
 }
 
 /// Run the official soroban build inside the pinned image and return the
@@ -735,8 +784,9 @@ impl ForgePlugin for VerifyPlugin {
             .arg(
                 Arg::new("contract-id")
                     .required(true)
+                    .num_args(1..)
                     .value_name("CONTRACT_ID")
-                    .help("Deployed contract ID (C…)"),
+                    .help("One or more deployed contract IDs (C…)"),
             )
             .arg(
                 Arg::new("path")
@@ -771,12 +821,19 @@ impl ForgePlugin for VerifyPlugin {
                     .action(ArgAction::SetTrue)
                     .help("Build the contract inside the pinned reproducible-build container before hashing"),
             )
+            .arg(
+                Arg::new("keep-fetched")
+                    .long("keep-fetched")
+                    .value_name("PATH")
+                    .help("Keep the fetched on-chain wasm at PATH; with multiple IDs, PATH must be a directory"),
+            )
     }
 
     fn run(&self, matches: &ArgMatches, ctx: &ForgeContext) -> Result<()> {
-        let contract_id = matches
-            .get_one::<String>("contract-id")
-            .expect("contract-id is required by clap");
+        let contract_ids: Vec<&String> = matches
+            .get_many::<String>("contract-id")
+            .expect("contract-id is required by clap")
+            .collect();
 
         if ctx.offline {
             return Err(ForgeError::InvalidArgument(
@@ -798,25 +855,59 @@ impl ForgePlugin for VerifyPlugin {
         );
 
         let reproducible = matches.get_flag("reproducible");
-        let report = verify(
-            contract_id,
-            &dir,
-            wasm_override.as_deref(),
-            &network,
-            reproducible,
-            ctx.timeout(),
-        )?;
-
-        if ctx.json {
-            println!("{}", json_report(&report));
-        } else if !ctx.quiet {
-            print!("{}", format_report(&report));
+        let keep_fetched = matches
+            .get_one::<String>("keep-fetched")
+            .map(|p| ctx.cwd.join(p));
+        if contract_ids.len() > 1 {
+            if let Some(path) = &keep_fetched {
+                if !path.is_dir() {
+                    return Err(ForgeError::InvalidArgument(format!(
+                        "--keep-fetched must name a directory when verifying multiple contract IDs: {}",
+                        path.display()
+                    )));
+                }
+            }
         }
 
-        if report.matches {
+        let mut reports = Vec::with_capacity(contract_ids.len());
+        for contract_id in contract_ids {
+            let keep_path = keep_fetched.as_ref().map(|path| {
+                if path.is_dir() {
+                    path.join(format!("{contract_id}.wasm"))
+                } else {
+                    path.clone()
+                }
+            });
+            reports.push(verify_with_keep_fetched(
+                contract_id,
+                &dir,
+                wasm_override.as_deref(),
+                &network,
+                reproducible,
+                ctx.timeout(),
+                keep_path.as_deref(),
+            )?);
+        }
+
+        if ctx.json {
+            println!("{}", json_reports(&reports));
+        } else if !ctx.quiet {
+            print!("{}", format_reports(&reports));
+        }
+
+        if reports_match(&reports) {
             Ok(())
         } else {
-            Err(mismatch_error(&report))
+            let mismatches: Vec<&str> = reports
+                .iter()
+                .filter(|report| !report.matches)
+                .map(|report| report.contract_id.as_str())
+                .collect();
+            Err(ForgeError::VerificationFailed(format!(
+                "{} contract verification mismatch(es): {}",
+                mismatches.len(),
+                mismatches.join(", ")
+            )))
         }
     }
 }
@@ -950,7 +1041,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // No Cargo.toml, no wasm, no `stellar` on PATH — the ID check still
         // decides the outcome, so nothing here shells out.
-        let err = verify("nope", tmp.path(), None, &NetworkArgs::default(), false, None).unwrap_err();
+        let err = verify(
+            "nope",
+            tmp.path(),
+            None,
+            &NetworkArgs::default(),
+            false,
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("not a valid contract ID"), "{err}");
     }
 
@@ -963,7 +1062,15 @@ mod tests {
         )
         .unwrap();
 
-        let err = verify(VALID_ID, tmp.path(), None, &NetworkArgs::default(), false, None).unwrap_err();
+        let err = verify(
+            VALID_ID,
+            tmp.path(),
+            None,
+            &NetworkArgs::default(),
+            false,
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("stellar contract build"), "{err}");
     }
 
@@ -1032,6 +1139,46 @@ mod tests {
         assert_eq!(parsed["network"], "testnet");
         assert_eq!(parsed["local_hash"], "aa");
         assert_eq!(parsed["onchain_hash"], "bb");
+    }
+
+    #[test]
+    fn batch_reports_are_an_array_and_preserve_each_verdict() {
+        let matching = VerifyReport::new(VALID_ID, "testnet", Path::new("a.wasm"), "aa", "aa");
+        let mismatching = VerifyReport::new(
+            "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+            "testnet",
+            Path::new("b.wasm"),
+            "aa",
+            "bb",
+        );
+        let reports = vec![matching, mismatching];
+
+        assert!(!reports_match(&reports));
+        let parsed: serde_json::Value = serde_json::from_str(&json_reports(&reports)).unwrap();
+        assert!(parsed.is_array());
+        assert_eq!(parsed.as_array().unwrap().len(), 2);
+        assert_eq!(parsed[0]["match"], true);
+        assert_eq!(parsed[1]["match"], false);
+
+        let text = format_reports(&reports);
+        assert!(
+            text.contains("verified") && text.contains("MISMATCH"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn keeping_a_fetched_wasm_copies_it_outside_the_temporary_location() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fetched = tmp.path().join("fetched.wasm");
+        let kept = tmp.path().join("kept.wasm");
+        let bytes = wasm_bytes(b"on-chain");
+        std::fs::write(&fetched, &bytes).unwrap();
+
+        copy_fetched_wasm(&fetched, &kept).unwrap();
+        std::fs::remove_file(&fetched).unwrap();
+
+        assert_eq!(std::fs::read(&kept).unwrap(), bytes);
     }
 
     #[test]
