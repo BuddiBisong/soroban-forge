@@ -26,5 +26,6 @@
 - [SDK Upgrades & Migrations](upgrade-guide.md)
   - [Contract WASM Upgrades](upgrades.md)
 - [DX & Developer Tooling](tooling.md)
+  - [Generating the CHANGELOG](changelog.md)
 - [Troubleshooting & FAQ](troubleshooting.md)
   - [FAQ](faq.md)
