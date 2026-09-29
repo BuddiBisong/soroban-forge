@@ -344,6 +344,8 @@ pub enum SpecFormat {
     Json,
     /// Markdown documentation table of entrypoints and referenced custom types.
     Markdown,
+    /// Raw XDR-base64 output from stellar CLI for tooling that needs it directly.
+    Xdr,
 }
 
 impl SpecFormat {
@@ -352,6 +354,7 @@ impl SpecFormat {
         match self {
             SpecFormat::Rust => "rust",
             SpecFormat::Json | SpecFormat::Markdown => "json-formatted",
+            SpecFormat::Xdr => "xdr-base64",
         }
     }
 
@@ -372,8 +375,9 @@ pub fn resolve_format(matches: &ArgMatches, ctx: &ForgeContext) -> Result<SpecFo
             "md" | "markdown" => Ok(SpecFormat::Markdown),
             "json" => Ok(SpecFormat::Json),
             "rust" | "text" => Ok(SpecFormat::Rust),
+            "xdr" => Ok(SpecFormat::Xdr),
             other => Err(ForgeError::InvalidArgument(format!(
-                "unsupported spec format `{other}`; expected `rust`, `json` or `md`"
+                "unsupported spec format `{other}`; expected `rust`, `json`, `xdr` or `md`"
             ))),
         }
     } else if ctx.json {
@@ -810,8 +814,13 @@ impl ForgePlugin for SpecPlugin {
             .arg(
                 Arg::new("format")
                     .long("format")
-                    .value_parser(["rust", "text", "json", "md", "markdown"])
-                    .help("Output format: rust (default), json, or md for Markdown tables"),
+                    .value_parser(["rust", "text", "json", "md", "markdown", "xdr"])
+                    .help("Output format: rust (default), json, xdr, or md for Markdown tables"),
+            )
+            .arg(
+                Arg::new("contract")
+                    .long("contract")
+                    .help("Contract name to target in a multi-contract workspace [default: the only contract if unique]"),
             )
             .arg(
                 Arg::new("network")
