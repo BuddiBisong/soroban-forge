@@ -1,5 +1,48 @@
+# Rust build artefacts
 target/
 *.wasm
+
+# OS / editor noise
 .DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local project directories created during development
 /demo
 /book
+
+# Test snapshots (auto-generated; regenerate with --update-snapshots)
+**/*.snap
+**/*.snap.new
+**/snapshots/
+
+# Soroban-forge spec cache (written to $TMPDIR at runtime, not the repo)
+# If ever a local cache dir is added inside the repo, exclude it:
+.spec-cache/
+
+# Coverage / profiling artefacts
+lcov.info
+coverage/
+*.profraw
+*.profdata
+
+# mdBook output
+/book/
+
+# Generated example projects that are kept in the repo are tracked
+# intentionally; exclude any scratch example outputs created locally:
+/examples-scratch/
+
+# Node / frontend artefacts (for docs site or binding generators)
+node_modules/
+dist/
+.next/
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key
