@@ -12,8 +12,9 @@
 //! - Docker (optional, used for reproducible wasm builds)
 //! - free disk space (optional warning when below 1 GiB, since wasm/target builds can be large)
 //! - when run inside a contract project: the project's `soroban-sdk`
-//!   version, compared against the version pinned into new projects
-//!   (`soroban_forge_scaffold::SOROBAN_SDK_VERSION`)
+//!   version, compared against the latest stable version published on
+//!   crates.io (falling back to the version pinned into new projects when
+//!   crates.io cannot be reached)
 //! - when run inside a cargo project: a `Cargo.lock` that version control
 //!   will carry, since a missing or gitignored lockfile leaves CI resolving
 //!   fresh dependency versions on every build
@@ -123,47 +124,81 @@ fn dep_version(dep: &toml::Value) -> Option<String> {
     }
 }
 
-/// Check the project's `soroban-sdk` version against the version pinned into
-/// freshly scaffolded projects.
+/// Fetch the latest stable `soroban-sdk` version published on crates.io.
+///
+/// This check is advisory, so registry/network errors are intentionally
+/// ignored by the caller and fall back to the version pinned in templates.
+fn latest_published_sdk_version() -> Option<String> {
+    let response = ureq::get("https://crates.io/api/v1/crates/soroban-sdk")
+        .set("User-Agent", "soroban-forge")
+        .timeout(std::time::Duration::from_secs(3))
+        .call()
+        .ok()?
+        .into_string()
+        .ok()?;
+    let body: serde_json::Value = serde_json::from_str(&response).ok()?;
+    let krate = body.get("crate")?;
+    let version = krate
+        .get("max_stable_version")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| krate.get("max_version").and_then(serde_json::Value::as_str))?;
+    parse_semverish(version).map(|_| version.to_owned())
+}
+
+/// Check the project's `soroban-sdk` version against the latest published
+/// stable version (or the template pin when the registry is unavailable).
 ///
 /// Returns `None` (no report line at all) when `project_dir` does not look
 /// like a contract project: no readable/parseable `Cargo.toml`, or a
 /// manifest without a `soroban-sdk` dependency. Otherwise:
 ///
-/// - `Pass` when the declared version is at or above the pinned one
+/// - `Pass` when the declared version is at or above the latest version
 /// - `Warn` when it is behind, unversioned, or unparseable
 pub fn sdk_version_check(project_dir: &Path) -> Option<Check> {
+    sdk_version_check_with(project_dir, latest_published_sdk_version)
+}
+
+fn sdk_version_check_with(
+    project_dir: &Path,
+    latest_version: impl FnOnce() -> Option<String>,
+) -> Option<Check> {
     let contents = std::fs::read_to_string(project_dir.join("Cargo.toml")).ok()?;
     let manifest: toml::Value = toml::from_str(&contents).ok()?;
     let declared = manifest_sdk_version(&manifest)?;
-    let pinned = parse_semverish(SOROBAN_SDK_VERSION)?;
+    let latest = latest_version().filter(|version| parse_semverish(version).is_some());
+    let latest_available = latest.is_some();
+    let latest = latest.unwrap_or_else(|| SOROBAN_SDK_VERSION.to_owned());
+    let latest_parsed = parse_semverish(&latest)?;
+    let latest_label = if latest_available {
+        format!("latest: {latest}")
+    } else {
+        format!("latest published unavailable; template pin: {latest}")
+    };
 
     Some(match declared {
         None => Check {
             name: "soroban-sdk",
             status: Status::Warn,
-            detail: format!("no version specified (latest pinned: {SOROBAN_SDK_VERSION})"),
+            detail: format!("no version specified ({latest_label})"),
             fix: Some("pin a soroban-sdk version in Cargo.toml"),
         },
         Some(raw) => match parse_semverish(&raw) {
-            Some(found) if found >= pinned => Check {
+            Some(found) if found >= latest_parsed => Check {
                 name: "soroban-sdk",
                 status: Status::Pass,
-                detail: format!("soroban-sdk {raw}"),
+                detail: format!("soroban-sdk {raw} ({latest_label})"),
                 fix: None,
             },
             Some(_) => Check {
                 name: "soroban-sdk",
                 status: Status::Warn,
-                detail: format!("soroban-sdk {raw} (latest pinned: {SOROBAN_SDK_VERSION})"),
+                detail: format!("soroban-sdk {raw} ({latest_label})"),
                 fix: Some("update the soroban-sdk version in Cargo.toml"),
             },
             None => Check {
                 name: "soroban-sdk",
                 status: Status::Warn,
-                detail: format!(
-                    "could not parse version `{raw}` (latest pinned: {SOROBAN_SDK_VERSION})"
-                ),
+                detail: format!("could not parse version `{raw}` ({latest_label})"),
                 fix: Some("pin a concrete soroban-sdk version in Cargo.toml"),
             },
         },
@@ -1306,7 +1341,13 @@ impl DoctorPlugin {
         checks.extend(run_checks_with_network(false));
         checks.push(toolchain_check(&ctx.cwd)); // issue #109
         checks.push(wasm32_target_check(&ctx.cwd)); // issue #251
-        if let Some(check) = sdk_version_check(&ctx.cwd) {
+        if let Some(check) = sdk_version_check_with(&ctx.cwd, || {
+            if ctx.offline {
+                None
+            } else {
+                latest_published_sdk_version()
+            }
+        }) {
             checks.push(check);
         }
         // A committed lockfile, without which CI cannot reproduce a build.
@@ -1618,6 +1659,10 @@ mod tests {
         dir
     }
 
+    fn sdk_check_at_template_pin(project_dir: &Path) -> Option<Check> {
+        sdk_version_check_with(project_dir, || Some(SOROBAN_SDK_VERSION.into()))
+    }
+
     #[test]
     fn parses_common_version_requirements() {
         assert_eq!(parse_semverish("26.1.0"), Some((26, 1, 0)));
@@ -1648,7 +1693,7 @@ mod tests {
     #[test]
     fn no_op_without_manifest() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(sdk_version_check(dir.path()).is_none());
+        assert!(sdk_check_at_template_pin(dir.path()).is_none());
     }
 
     #[test]
@@ -1656,7 +1701,7 @@ mod tests {
         let dir = project_with_manifest(
             "[package]\nname = \"x\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
         );
-        assert!(sdk_version_check(dir.path()).is_none());
+        assert!(sdk_check_at_template_pin(dir.path()).is_none());
     }
 
     #[test]
@@ -1664,7 +1709,7 @@ mod tests {
         let dir = project_with_manifest(
             "[package]\nname = \"x\"\nversion = \"0.1.0\"\n\n[dependencies]\nsoroban-sdk = \"25.0.0\"\n",
         );
-        let check = sdk_version_check(dir.path()).unwrap();
+        let check = sdk_check_at_template_pin(dir.path()).unwrap();
         assert_eq!(check.status, Status::Warn);
         assert!(check.detail.contains("25.0.0"));
         assert!(check.detail.contains(SOROBAN_SDK_VERSION));
@@ -1676,8 +1721,11 @@ mod tests {
         let dir = project_with_manifest(&format!(
             "[package]\nname = \"x\"\nversion = \"0.1.0\"\n\n[dependencies]\nsoroban-sdk = \"{SOROBAN_SDK_VERSION}\"\n",
         ));
-        let check = sdk_version_check(dir.path()).unwrap();
+        let check = sdk_check_at_template_pin(dir.path()).unwrap();
         assert_eq!(check.status, Status::Pass);
+        assert!(check
+            .detail
+            .contains(&format!("latest: {SOROBAN_SDK_VERSION}")));
         assert!(check.fix.is_none());
     }
 
@@ -1686,7 +1734,10 @@ mod tests {
         let dir = project_with_manifest(
             "[package]\nname = \"x\"\nversion = \"0.1.0\"\n\n[dependencies]\nsoroban-sdk = \"99.0.0\"\n",
         );
-        assert_eq!(sdk_version_check(dir.path()).unwrap().status, Status::Pass);
+        assert_eq!(
+            sdk_check_at_template_pin(dir.path()).unwrap().status,
+            Status::Pass
+        );
     }
 
     #[test]
@@ -1694,14 +1745,17 @@ mod tests {
         let table = project_with_manifest(
             "[dependencies]\nsoroban-sdk = { version = \"25.1.2\", features = [\"testutils\"] }\n",
         );
-        let check = sdk_version_check(table.path()).unwrap();
+        let check = sdk_check_at_template_pin(table.path()).unwrap();
         assert_eq!(check.status, Status::Warn);
         assert!(check.detail.contains("25.1.2"));
 
         let dev = project_with_manifest(&format!(
             "[dev-dependencies]\nsoroban-sdk = \"{SOROBAN_SDK_VERSION}\"\n"
         ));
-        assert_eq!(sdk_version_check(dev.path()).unwrap().status, Status::Pass);
+        assert_eq!(
+            sdk_check_at_template_pin(dev.path()).unwrap().status,
+            Status::Pass
+        );
     }
 
     #[test]
@@ -1709,7 +1763,7 @@ mod tests {
         let dir = project_with_manifest(
             "[dependencies]\nsoroban-sdk = { git = \"https://example.com/sdk\" }\n",
         );
-        let check = sdk_version_check(dir.path()).unwrap();
+        let check = sdk_check_at_template_pin(dir.path()).unwrap();
         assert_eq!(check.status, Status::Warn);
         assert!(check.detail.contains("no version specified"));
     }
@@ -1770,6 +1824,17 @@ mod tests {
         assert_eq!(
             config_network_url(Some(&config)).as_deref(),
             Some("https://example.com/custom")
+    fn warns_when_project_sdk_is_behind_latest_published() {
+        let dir = project_with_manifest(
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n\n[dependencies]\nsoroban-sdk = \"26.1.0\"\n",
+        );
+        let check = sdk_version_check_with(dir.path(), || Some("27.0.0".into())).unwrap();
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("soroban-sdk 26.1.0"));
+        assert!(check.detail.contains("latest: 27.0.0"));
+        assert_eq!(
+            check.fix,
+            Some("update the soroban-sdk version in Cargo.toml")
         );
     }
 
@@ -1788,6 +1853,14 @@ mod tests {
             Some("my-private-net"),
             "an unknown name with no rpc_url has nothing else to fall back to"
         );
+    fn falls_back_to_template_pin_when_registry_is_unavailable() {
+        let dir = project_with_manifest(&format!(
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n\n[dependencies]\nsoroban-sdk = \"{SOROBAN_SDK_VERSION}\"\n",
+        ));
+        let check = sdk_version_check_with(dir.path(), || None).unwrap();
+        assert_eq!(check.status, Status::Pass);
+        assert!(check.detail.contains("latest published unavailable"));
+        assert!(check.detail.contains(SOROBAN_SDK_VERSION));
     }
 
     #[test]

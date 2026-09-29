@@ -1134,6 +1134,7 @@ dependencies = [
  "soroban-forge-scaffold",
  "tempfile",
  "toml",
+ "ureq",
 ]
 
 [[package]]
