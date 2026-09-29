@@ -93,6 +93,26 @@ impl NetworkArgs {
         }
     }
 
+    /// Resolve CLI network options over project/user `[network]` defaults.
+    pub fn resolve_with_config(
+        network: Option<String>,
+        rpc_url: Option<String>,
+        network_passphrase: Option<String>,
+        config: Option<&soroban_forge_core::config::NetworkConfig>,
+    ) -> Self {
+        let cfg = config.cloned().unwrap_or_default();
+        let network = match (network.as_ref(), rpc_url.as_ref()) {
+            (Some(name), _) => Some(name.clone()),
+            (None, None) => Some(cfg.name.unwrap_or_else(|| DEFAULT_NETWORK.to_string())),
+            (None, Some(_)) => cfg.name,
+        };
+        Self {
+            network,
+            rpc_url: rpc_url.or(cfg.rpc_url),
+            network_passphrase: network_passphrase.or(cfg.passphrase),
+        }
+    }
+
     /// What to show in the report as "the network we deployed to".
     pub fn label(&self) -> String {
         self.network
@@ -903,9 +923,8 @@ impl ForgePlugin for DeployPlugin {
                 Arg::new("source")
                     .long("source")
                     .short('s')
-                    .required(true)
                     .value_name("IDENTITY")
-                    .help("Source account/identity that funds and signs the deployment"),
+                    .help("Source account/identity that funds and signs the deployment [default: config identity.default]"),
             )
             .arg(
                 Arg::new("network")
@@ -966,10 +985,21 @@ impl ForgePlugin for DeployPlugin {
         let wasm_override = matches.get_one::<String>("wasm").map(|p| ctx.cwd.join(p));
         let source = matches
             .get_one::<String>("source")
-            .expect("source is required by clap");
+            .cloned()
+            .or_else(|| {
+                ctx.config
+                    .as_ref()
+                    .and_then(|config| config.identity.default.clone())
+            })
+            .ok_or_else(|| {
+                ForgeError::InvalidArgument(
+                    "missing source identity: pass --source or set [identity].default in config"
+                        .into(),
+                )
+            })?;
         let upgrade_contract_id = matches.get_one::<String>("upgrade");
 
-        if let Some(suggestion) = source_identity_suggestion(source) {
+        if let Some(suggestion) = source_identity_suggestion(&source) {
             if !ctx.quiet && !ctx.json {
                 eprintln!(
                     "note: `{source}` is not a local soroban-forge identity; did you mean `{suggestion}`? \
@@ -978,30 +1008,29 @@ impl ForgePlugin for DeployPlugin {
             }
         }
 
-        let network = NetworkArgs::resolve(
+        let network = NetworkArgs::resolve_with_config(
             matches.get_one::<String>("network").cloned(),
             matches.get_one::<String>("rpc-url").cloned(),
             matches.get_one::<String>("network-passphrase").cloned(),
+            ctx.config.as_ref().map(|config| &config.network),
         );
 
         if !dry_run && !ctx.offline && network.is_testnet() {
-            ensure_source_funded(source, &network, auto_fund, ctx)?;
+            ensure_source_funded(&source, &network, auto_fund, ctx)?;
         }
 
         if dry_run {
             let wasm_path = build_if_needed(&dir, wasm_override.as_deref())?;
             let args = match upgrade_contract_id {
-                Some(contract_id) => build_upgrade_args(contract_id, &wasm_path, source, &network)?,
-                None => build_deploy_args(&wasm_path, source, &network)?,
+                Some(contract_id) => build_upgrade_args(contract_id, &wasm_path, &source, &network)?,
+                None => build_deploy_args(&wasm_path, &source, &network)?,
             };
             let command_line = format_dry_run_command("stellar", &args);
             if ctx.json {
-                let report = serde_json::json!({ "commands": commands });
+                let report = serde_json::json!({ "commands": [command_line] });
                 println!("{}", serde_json::to_string_pretty(&report).unwrap());
             } else {
-                for command in commands {
-                    println!("{command}");
-                }
+                println!("{command_line}");
             }
             return Ok(());
         }
@@ -1015,7 +1044,7 @@ impl ForgePlugin for DeployPlugin {
             run_stellar_upgrade(
                 contract_id,
                 &wasm_path,
-                source,
+                &source,
                 &network,
                 ctx.timeout(),
                 ctx.verbose > 0,
@@ -1036,30 +1065,23 @@ impl ForgePlugin for DeployPlugin {
         let contract_id = deploy_with_output(
             &dir,
             wasm_override.as_deref(),
-            source,
+            &source,
             &network,
             ctx.timeout(),
             ctx.verbose > 0,
         )?;
 
         if ctx.json {
-            let report: Vec<_> = reports
-                .iter()
-                .map(|(network, contract_id)| serde_json::json!({
-                    "contract_id": contract_id,
-                    "network": network,
-                }))
-                .collect();
+            let report = serde_json::json!({
+                "contract_id": contract_id,
+                "network": network.label(),
+            });
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
         } else if !ctx.quiet {
-            for (network, contract_id) in reports {
-                println!("deployed to {network}");
-                println!("contract ID: {contract_id}");
-            }
+            println!("deployed to {}", network.label());
+            println!("contract ID: {contract_id}");
         } else {
-            for (_, contract_id) in reports {
-                println!("{contract_id}");
-            }
+            println!("{contract_id}");
         }
         Ok(())
     }
@@ -1116,6 +1138,29 @@ mod tests {
         let network = NetworkArgs::resolve(None, None, None);
         assert_eq!(network.label(), "testnet");
         assert_eq!(network.cli_args(), vec!["--network", "testnet"]);
+    }
+
+    #[test]
+    fn project_or_user_network_defaults_are_used_but_cli_wins() {
+        let config = soroban_forge_core::config::NetworkConfig {
+            name: Some("mainnet".into()),
+            rpc_url: Some("https://configured.example".into()),
+            passphrase: Some("configured passphrase".into()),
+        };
+        let configured = NetworkArgs::resolve_with_config(None, None, None, Some(&config));
+        assert_eq!(configured.network.as_deref(), Some("mainnet"));
+        assert_eq!(configured.rpc_url.as_deref(), Some("https://configured.example"));
+        assert_eq!(configured.network_passphrase.as_deref(), Some("configured passphrase"));
+
+        let cli = NetworkArgs::resolve_with_config(
+            Some("testnet".into()),
+            Some("https://cli.example".into()),
+            Some("cli passphrase".into()),
+            Some(&config),
+        );
+        assert_eq!(cli.network.as_deref(), Some("testnet"));
+        assert_eq!(cli.rpc_url.as_deref(), Some("https://cli.example"));
+        assert_eq!(cli.network_passphrase.as_deref(), Some("cli passphrase"));
     }
 
     #[test]

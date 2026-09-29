@@ -7,6 +7,9 @@
 //!
 //! [scaffold]
 //! default_template = "hello-world"
+//!
+//! User defaults are read from `~/.config/soroban-forge/config.toml` and may
+//! set `[network]`, `[identity] default`, and `[scaffold]` values.
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -32,6 +35,8 @@ pub struct ForgeConfig {
     pub network: NetworkConfig,
     #[serde(default)]
     pub bindings: BindingsConfig,
+    #[serde(default)]
+    pub identity: IdentityConfig,
 }
 
 /// `[bindings]` section — top-level bindings configuration.
@@ -65,6 +70,12 @@ pub struct ScaffoldConfig {
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+pub struct IdentityConfig {
+    /// Default source identity for commands that sign transactions.
+    pub default: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
 pub struct DefaultsConfig {
     pub timeout_secs: Option<u64>,
     /// Maximum size in bytes for `optimize --check`.
@@ -90,6 +101,55 @@ pub struct NetworkConfig {
 }
 
 impl ForgeConfig {
+    /// Path to the optional user-wide defaults file.
+    pub fn user_config_path() -> Option<PathBuf> {
+        let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .or_else(|| std::env::var_os("USERPROFILE"))
+                    .map(|home| PathBuf::from(home).join(".config"))
+            })?;
+        Some(config_dir.join("soroban-forge").join("config.toml"))
+    }
+
+    /// Merge user defaults beneath project configuration, field by field.
+    /// User config contributes network, identity, and template defaults only;
+    /// project metadata remains local to each project.
+    pub fn load_effective(project: Option<Self>, user: Option<Self>) -> Option<Self> {
+        if project.is_none() && user.is_none() {
+            return None;
+        }
+        let mut effective = project.clone().unwrap_or_default();
+        let user = user.unwrap_or_default();
+        let project = project.unwrap_or_default();
+        effective.scaffold.default_template = project
+            .scaffold
+            .default_template
+            .or(user.scaffold.default_template);
+        effective.network.name = project.network.name.or(user.network.name);
+        effective.network.rpc_url = project.network.rpc_url.or(user.network.rpc_url);
+        effective.network.passphrase = project
+            .network
+            .passphrase
+            .or(user.network.passphrase);
+        effective.identity.default = project.identity.default.or(user.identity.default);
+        Some(effective)
+    }
+
+    /// Read the optional user-level defaults file. Missing files are normal;
+    /// malformed or unreadable files return a configuration error.
+    pub fn load_user_config() -> Result<Option<Self>> {
+        let Some(path) = Self::user_config_path() else {
+            return Ok(None);
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+        Self::load_from_path(&path).map(Some)
+    }
+
     /// Load `forge.toml` from `dir`, returning `Ok(None)` when the file does
     /// not exist and an error only when it exists but cannot be parsed.
     pub fn load_from(dir: &Path) -> Result<Option<Self>> {
@@ -236,6 +296,7 @@ max_size = 65536
             "[network] rpc_url",
             "[network] passphrase",
             "[bindings.ts] output",
+            "[identity] default",
         ];
         for key in keys {
             let needle = format!("`{key}`");
@@ -263,7 +324,13 @@ pub fn unknown_keys(raw: &str) -> std::result::Result<Vec<String>, toml::de::Err
             "scaffold" => {
                 collect_strays(value, &["default_template"], "scaffold", &mut strays)
             }
-            "network" => collect_strays(value, &["name", "rpc_url", "passphrase"], "network", &mut strays),
+            "network" => collect_strays(
+                value,
+                &["name", "rpc_url", "passphrase"],
+                "network",
+                &mut strays,
+            ),
+            "identity" => collect_strays(value, &["default"], "identity", &mut strays),
             "defaults" => {
                 collect_strays(
                     value,
@@ -365,6 +432,11 @@ pub fn resolved_report(config: &Option<ForgeConfig>) -> String {
         Some(passphrase) => out.push_str(&format!("passphrase = \"{passphrase}\"\n")),
         None => out.push_str("# passphrase = (unset)\n"),
     }
+    out.push_str("\n[identity]\n");
+    match &config.identity.default {
+        Some(identity) => out.push_str(&format!("default = \"{identity}\"\n")),
+        None => out.push_str("# default = (unset)\n"),
+    }
     out.push_str("\n[defaults.ci-init]\n");
     match config.defaults.ci_init.max_size {
         Some(max_size) => out.push_str(&format!("max_size = {max_size}\n")),
@@ -436,9 +508,36 @@ mod resolved_tests {
     }
 
     #[test]
+    fn project_values_override_user_defaults_field_by_field() {
+        let user: ForgeConfig = toml::from_str(
+            "[network]\nname = \"mainnet\"\nrpc_url = \"https://user.example\"\n[identity]\ndefault = \"alice\"\n[scaffold]\ndefault_template = \"token\"\n[project]\nauthors = [\"Global Author\"]\n",
+        )
+        .unwrap();
+        let project: ForgeConfig = toml::from_str(
+            "[network]\nrpc_url = \"https://project.example\"\n[identity]\ndefault = \"bob\"\n",
+        )
+        .unwrap();
+
+        let effective = ForgeConfig::load_effective(Some(project), Some(user)).unwrap();
+        assert_eq!(effective.network.name.as_deref(), Some("mainnet"));
+        assert_eq!(
+            effective.network.rpc_url.as_deref(),
+            Some("https://project.example")
+        );
+        assert_eq!(effective.identity.default.as_deref(), Some("bob"));
+        assert_eq!(effective.scaffold.default_template.as_deref(), Some("token"));
+        assert!(effective.project.authors.is_empty());
+    }
+
+    #[test]
+    fn no_project_or_user_config_remains_absent() {
+        assert!(ForgeConfig::load_effective(None, None).is_none());
+    }
+
+    #[test]
     fn valid_keys_produce_no_warnings() {
         let strays = unknown_keys(
-            "[project]\nname = \"demo\"\nauthors = []\n[scaffold]\ndefault_template = \"token\"\n",
+            "[project]\nname = \"demo\"\nauthors = []\n[scaffold]\ndefault_template = \"token\"\n[identity]\ndefault = \"alice\"\n",
         )
         .unwrap();
         assert!(strays.is_empty());

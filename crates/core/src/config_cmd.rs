@@ -3,7 +3,7 @@
 
 use clap::{ArgMatches, Command};
 
-use crate::config::{resolved_report, unknown_keys, CONFIG_FILE_NAME};
+use crate::config::{resolved_report, unknown_keys, ForgeConfig, CONFIG_FILE_NAME};
 use crate::error::{ForgeError, Result};
 use crate::plugin::{ForgeContext, ForgePlugin};
 
@@ -17,7 +17,7 @@ impl ForgePlugin for ConfigPlugin {
 
     fn command(&self) -> Command {
         Command::new("config")
-            .about("Print the resolved forge.toml configuration (defaults filled in) and warn about unknown keys")
+            .about("Print the resolved project and user configuration (defaults filled in) and warn about unknown keys")
     }
 
     fn run(&self, _matches: &ArgMatches, ctx: &ForgeContext) -> Result<()> {
@@ -34,10 +34,22 @@ impl ForgePlugin for ConfigPlugin {
         } else {
             Vec::new()
         };
+        let user_path = ForgeConfig::user_config_path();
+        let user_strays = if let Some(user_path) = user_path.as_ref().filter(|p| p.is_file()) {
+            let raw = std::fs::read_to_string(user_path)
+                .map_err(ForgeError::io(format!("reading {}", user_path.display())))?;
+            unknown_keys(&raw).map_err(|e| ForgeError::Config {
+                path: user_path.clone(),
+                message: e.to_string(),
+            })?
+        } else {
+            Vec::new()
+        };
 
         if ctx.json {
             let report = serde_json::json!({
                 "config_file_present": path.is_file(),
+                "user_config_file": user_path.as_ref().filter(|p| p.is_file()).map(|p| p.display().to_string()),
                 "resolved": {
                     "project": {
                         "name": ctx.config.as_ref().and_then(|c| c.project.name.clone()),
@@ -48,16 +60,27 @@ impl ForgePlugin for ConfigPlugin {
                             .and_then(|c| c.scaffold.default_template.clone())
                             .unwrap_or_else(|| "hello-world".to_string()),
                     },
+                    "network": {
+                        "name": ctx.config.as_ref().and_then(|c| c.network.name.clone()),
+                        "rpc_url": ctx.config.as_ref().and_then(|c| c.network.rpc_url.clone()),
+                        "passphrase": ctx.config.as_ref().and_then(|c| c.network.passphrase.clone()),
+                    },
+                    "identity": {
+                        "default": ctx.config.as_ref().and_then(|c| c.identity.default.clone()),
+                    },
                 },
                 "unknown_keys": strays,
+                "user_unknown_keys": user_strays,
             });
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
             return Ok(());
         }
 
         if !ctx.quiet {
-            if !path.is_file() {
-                println!("# no {CONFIG_FILE_NAME} found — showing defaults\n");
+            if !path.is_file() && !user_path.as_ref().is_some_and(|p| p.is_file()) {
+                println!("# no project or user config found — showing defaults\n");
+            } else if !path.is_file() {
+                println!("# no {CONFIG_FILE_NAME} found — showing user defaults\n");
             }
             print!("{}", resolved_report(&ctx.config));
         }
@@ -65,6 +88,11 @@ impl ForgePlugin for ConfigPlugin {
         // under --quiet (matching "errors still go to stderr").
         for key in &strays {
             eprintln!("warning: unknown key `{key}` in {CONFIG_FILE_NAME}");
+        }
+        if let Some(user_path) = user_path {
+            for key in &user_strays {
+                eprintln!("warning: unknown key `{key}` in {}", user_path.display());
+            }
         }
         Ok(())
     }

@@ -11,7 +11,40 @@
 | `--cwd`/`-C` | — | cwd | Run from DIR |
 | `--offline` | `SOROBAN_FORGE_OFFLINE` | `false` | No network |
 
-Precedence: CLI flag > env var > forge.toml > default.
+For configurable command values, precedence is **CLI flag > project
+`forge.toml` > user `config.toml` > built-in default**. Environment variables
+continue to provide the documented values for global flags; they do not
+override project or user configuration values. `--config PATH` selects an
+explicit project-config file instead of discovering `forge.toml`, while the
+user config remains the fallback for values it omits.
+
+## User defaults
+
+Optional user-wide defaults live at
+`~/.config/soroban-forge/config.toml` (or
+`$XDG_CONFIG_HOME/soroban-forge/config.toml` when `XDG_CONFIG_HOME` is set).
+Missing files are ignored; an existing but unreadable or invalid TOML file is
+reported as an error. The file
+accepts the same network and template sections as `forge.toml`, plus a default
+source identity:
+
+```toml
+[network]
+name = "testnet"
+# rpc_url = "https://soroban-testnet.stellar.org"
+# passphrase = "Test SDF Network ; September 2015"
+
+[identity]
+default = "deployer"
+
+[scaffold]
+default_template = "hello-world"
+```
+
+`--network`, `--rpc-url`, `--network-passphrase`, `--source`, and
+`--template` override configured values for that invocation. Project values
+override user values independently, so a project can override only its
+network while still inheriting the user's identity and template.
 
 ## `forge.toml` reference
 
@@ -33,6 +66,7 @@ tests (`unknown_keys`) flag anything else in the file as an unrecognized key.
 | `[network] name` | string | none (falls back to `"testnet"`, [`DEFAULT_NETWORK`](../crates/verify/src/lib.rs)) | `network use` (writes this key); `deploy`, `invoke`, `verify` (default `--network` via `NetworkArgs::resolve`, CLI flags win); `doctor` (health-check target) |
 | `[network] rpc_url` | string | none | `deploy`, `invoke`, `verify` (default `--rpc-url` via `NetworkArgs::resolve`); `doctor` (health-check endpoint) |
 | `[network] passphrase` | string | none | `deploy`, `invoke`, `verify` (default `--network-passphrase` via `NetworkArgs::resolve`); `identity fund` (refuses to run against a passphrase containing `"Public Global Stellar Network"`, i.e. mainnet) |
+| `[identity] default` | string | none | `deploy`, `invoke` (default `--source` identity; CLI `--source` wins) |
 | `[optimize] max-size` (alias `max_size`) | integer (bytes) | none | `optimize --check` (fails when the built wasm exceeds this). Read directly from `forge.toml` by `soroban-forge-optimize`, independent of `ForgeConfig` above — so it is *not* covered by `config`'s unknown-key warning or its resolved-config printout |
 | `[bindings.ts] output` | string (path) | `"bindings/typescript"` | `bindings ts` (default output directory for the generated TypeScript package, relative to the contract project directory; overridden by `--out-dir` / `--output` on the command line) |
 

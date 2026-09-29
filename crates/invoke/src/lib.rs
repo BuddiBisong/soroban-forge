@@ -60,6 +60,26 @@ impl NetworkArgs {
         }
     }
 
+    /// Resolve CLI network options over project/user `[network]` defaults.
+    pub fn resolve_with_config(
+        network: Option<String>,
+        rpc_url: Option<String>,
+        network_passphrase: Option<String>,
+        config: Option<&soroban_forge_core::config::NetworkConfig>,
+    ) -> Self {
+        let cfg = config.cloned().unwrap_or_default();
+        let network = match (network.as_ref(), rpc_url.as_ref()) {
+            (Some(name), _) => Some(name.clone()),
+            (None, None) => Some(cfg.name.unwrap_or_else(|| DEFAULT_NETWORK.to_string())),
+            (None, Some(_)) => cfg.name,
+        };
+        Self {
+            network,
+            rpc_url: rpc_url.or(cfg.rpc_url),
+            network_passphrase: network_passphrase.or(cfg.passphrase),
+        }
+    }
+
     /// The corresponding `stellar` CLI arguments.
     pub fn cli_args(&self) -> Vec<String> {
         let mut args = Vec::new();
@@ -514,9 +534,8 @@ impl ForgePlugin for InvokePlugin {
                 Arg::new("source")
                     .long("source")
                     .short('s')
-                    .required(true)
                     .value_name("IDENTITY")
-                    .help("Source account/identity that signs the invocation"),
+                    .help("Source account/identity that signs the invocation [default: config identity.default]"),
             )
             .arg(
                 Arg::new("network")
@@ -572,10 +591,11 @@ impl ForgePlugin for InvokePlugin {
             ));
         }
 
-        let network = NetworkArgs::resolve(
+        let network = NetworkArgs::resolve_with_config(
             matches.get_one::<String>("network").cloned(),
             matches.get_one::<String>("rpc-url").cloned(),
             matches.get_one::<String>("network-passphrase").cloned(),
+            ctx.config.as_ref().map(|config| &config.network),
         );
 
         // Issue #281: fall back to the recorded contract ID when none is given.
@@ -611,7 +631,18 @@ impl ForgePlugin for InvokePlugin {
             .collect();
         let source = matches
             .get_one::<String>("source")
-            .expect("source is required by clap");
+            .cloned()
+            .or_else(|| {
+                ctx.config
+                    .as_ref()
+                    .and_then(|config| config.identity.default.clone())
+            })
+            .ok_or_else(|| {
+                ForgeError::InvalidArgument(
+                    "missing source identity: pass --source or set [identity].default in config"
+                        .into(),
+                )
+            })?;
 
         // Issue #284: merge --args-file with inline args (inline wins).
         let fn_args = if let Some(args_path) = matches.get_one::<String>("args-file") {
@@ -626,7 +657,7 @@ impl ForgePlugin for InvokePlugin {
             let sim =
                 run_stellar_simulate(
                 &contract_id,
-                source,
+                &source,
                 &network,
                 function,
                 &fn_args,
@@ -681,8 +712,8 @@ impl ForgePlugin for InvokePlugin {
 
         if ctx.json {
             let result = run_stellar_invoke_json(
-                contract_id,
-                source,
+                &contract_id,
+                &source,
                 &network,
                 function,
                 &fn_args,
@@ -698,8 +729,8 @@ impl ForgePlugin for InvokePlugin {
             }
         } else {
             run_stellar_invoke(
-                contract_id,
-                source,
+                &contract_id,
+                &source,
                 &network,
                 function,
                 &fn_args,
@@ -722,6 +753,29 @@ mod tests {
     fn defaults_to_testnet() {
         let network = NetworkArgs::resolve(None, None, None);
         assert_eq!(network.cli_args(), vec!["--network", "testnet"]);
+    }
+
+    #[test]
+    fn configured_network_defaults_are_used_but_cli_wins() {
+        let config = soroban_forge_core::config::NetworkConfig {
+            name: Some("mainnet".into()),
+            rpc_url: Some("https://configured.example".into()),
+            passphrase: Some("configured passphrase".into()),
+        };
+        let configured = NetworkArgs::resolve_with_config(None, None, None, Some(&config));
+        assert_eq!(configured.network.as_deref(), Some("mainnet"));
+        assert_eq!(configured.rpc_url.as_deref(), Some("https://configured.example"));
+        assert_eq!(configured.network_passphrase.as_deref(), Some("configured passphrase"));
+
+        let cli = NetworkArgs::resolve_with_config(
+            Some("testnet".into()),
+            Some("https://cli.example".into()),
+            Some("cli passphrase".into()),
+            Some(&config),
+        );
+        assert_eq!(cli.network.as_deref(), Some("testnet"));
+        assert_eq!(cli.rpc_url.as_deref(), Some("https://cli.example"));
+        assert_eq!(cli.network_passphrase.as_deref(), Some("cli passphrase"));
     }
 
     #[test]
