@@ -734,9 +734,9 @@ impl ForgePlugin for VerifyPlugin {
             )
             .arg(
                 Arg::new("contract-id")
-                    .required(true)
+                    .required(false)
                     .value_name("CONTRACT_ID")
-                    .help("Deployed contract ID (C…)"),
+                    .help("Deployed contract ID (C…); omit to fall back to the last ID in deployments.json"),
             )
             .arg(
                 Arg::new("path")
@@ -774,10 +774,6 @@ impl ForgePlugin for VerifyPlugin {
     }
 
     fn run(&self, matches: &ArgMatches, ctx: &ForgeContext) -> Result<()> {
-        let contract_id = matches
-            .get_one::<String>("contract-id")
-            .expect("contract-id is required by clap");
-
         if ctx.offline {
             return Err(ForgeError::InvalidArgument(
                 "verify is unavailable in offline mode because it must fetch deployed wasm".into(),
@@ -797,9 +793,29 @@ impl ForgePlugin for VerifyPlugin {
             ctx.config.as_ref().map(|c| &c.network),
         );
 
+        // Issue #281: fall back to recorded contract ID when none is given.
+        let contract_id: String = match matches.get_one::<String>("contract-id") {
+            Some(id) => id.clone(),
+            None => {
+                let crate_name = read_crate_name(&dir).unwrap_or_default();
+                let net_label = network
+                    .network
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_NETWORK.to_string());
+                soroban_forge_deploy::lookup_recorded_contract_id(&dir, &crate_name, &net_label)
+                    .ok_or_else(|| {
+                        ForgeError::InvalidArgument(
+                            "no contract-id given and no deployment recorded in deployments.json — \
+                             run `soroban-forge deploy` first or pass a contract ID explicitly"
+                                .into(),
+                        )
+                    })?
+            }
+        };
+
         let reproducible = matches.get_flag("reproducible");
         let report = verify(
-            contract_id,
+            &contract_id,
             &dir,
             wasm_override.as_deref(),
             &network,
