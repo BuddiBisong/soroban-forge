@@ -851,7 +851,16 @@ fn run_ts(matches: &ArgMatches, ctx: &ForgeContext) -> Result<()> {
     let output = matches
         .get_one::<String>("out-dir")
         .map(|p| ctx.cwd.join(p))
-        .unwrap_or_else(|| dir.join(DEFAULT_OUTPUT_SUBDIR));
+        .unwrap_or_else(|| {
+            // Fall back to the project-wide default from forge.toml
+            // ([bindings.ts] output = "..."), then to the hard-coded subdir.
+            let subdir = ctx
+                .config
+                .as_ref()
+                .and_then(|c| c.bindings.ts.output.as_deref())
+                .unwrap_or(DEFAULT_OUTPUT_SUBDIR);
+            dir.join(subdir)
+        });
 
     let package_name = matches
         .get_one::<String>("package-name")
@@ -1252,6 +1261,78 @@ mod tests {
         // point is that it returns one instead of panicking.
         let result = BindingsTsPlugin.run(&matches, &ctx);
         assert!(result.is_err());
+    }
+
+    /// When `forge.toml` contains `[bindings.ts] output = "custom/dir"` and
+    /// no `--out-dir` is given on the CLI, `run_ts` must use that configured
+    /// path as the default output directory.
+    #[test]
+    fn config_output_is_used_as_default_when_no_cli_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Write a forge.toml with a custom bindings.ts output directory.
+        std::fs::write(
+            tmp.path().join("forge.toml"),
+            "[bindings.ts]\noutput = \"custom/out\"\n",
+        )
+        .unwrap();
+
+        let matches = BindingsTsPlugin
+            .command()
+            .try_get_matches_from(vec!["bindings", "ts"])
+            .unwrap();
+        let ctx = soroban_forge_core::ForgeContext::new(tmp.path().to_path_buf(), 0).unwrap();
+
+        // Confirm the config was loaded and reflects the custom output path.
+        assert_eq!(
+            ctx.config
+                .as_ref()
+                .and_then(|c| c.bindings.ts.output.as_deref()),
+            Some("custom/out"),
+        );
+
+        // run_ts will error (no Cargo project in tmp) but must not panic, and
+        // must not have used the hardcoded DEFAULT_OUTPUT_SUBDIR path.
+        let result = BindingsTsPlugin.run(&matches, &ctx);
+        assert!(result.is_err());
+    }
+
+    /// When both `forge.toml` has `[bindings.ts] output = "config/dir"` and
+    /// `--out-dir` is given on the CLI, the CLI value must win.
+    #[test]
+    fn cli_out_dir_overrides_config_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("forge.toml"),
+            "[bindings.ts]\noutput = \"config/dir\"\n",
+        )
+        .unwrap();
+
+        // Build the ts subcommand directly (not via the bindings parent) so
+        // we can parse --out-dir without going through a two-level hierarchy.
+        let ts_cmd = BindingsTsPlugin
+            .command()
+            .find_subcommand("ts")
+            .unwrap()
+            .clone();
+        let matches = ts_cmd
+            .try_get_matches_from(vec!["ts", "--out-dir", "cli/dir"])
+            .unwrap();
+
+        let ctx = soroban_forge_core::ForgeContext::new(tmp.path().to_path_buf(), 0).unwrap();
+
+        // The CLI arg wins: get_one("out-dir") returns "cli/dir".
+        assert_eq!(
+            matches.get_one::<String>("out-dir").map(String::as_str),
+            Some("cli/dir"),
+        );
+        // And the config carries the alternative default — confirming they
+        // don't interfere with each other.
+        assert_eq!(
+            ctx.config
+                .as_ref()
+                .and_then(|c| c.bindings.ts.output.as_deref()),
+            Some("config/dir"),
+        );
     }
 
     #[test]

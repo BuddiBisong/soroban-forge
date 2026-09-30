@@ -33,6 +33,7 @@ tests (`unknown_keys`) flag anything else in the file as an unrecognized key.
 | `[network] rpc_url` | string | none | `deploy`, `invoke`, `verify` (default `--rpc-url` via `NetworkArgs::resolve`); `doctor` (health-check endpoint) |
 | `[network] passphrase` | string | none | `deploy`, `invoke`, `verify` (default `--network-passphrase` via `NetworkArgs::resolve`); `identity fund` (refuses to run against a passphrase containing `"Public Global Stellar Network"`, i.e. mainnet) |
 | `[optimize] max-size` (alias `max_size`) | integer (bytes) | none | `optimize --check` (fails when the built wasm exceeds this). Read directly from `forge.toml` by `soroban-forge-optimize`, independent of `ForgeConfig` above — so it is *not* covered by `config`'s unknown-key warning or its resolved-config printout |
+| `[bindings.ts] output` | string (path) | `"bindings/typescript"` | `bindings ts` (default output directory for the generated TypeScript package, relative to the contract project directory; overridden by `--out-dir` / `--output` on the command line) |
 
 `[defaults] timeout_secs` and `[defaults] max_size` are parsed and echoed
 by `soroban-forge config` even though nothing currently consults them —
