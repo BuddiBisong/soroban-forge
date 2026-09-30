@@ -91,26 +91,76 @@ fn http_get(
     request.call()
 }
 
-/// Fund a Stellar testnet account via friendbot.
+/// Friendbot host for a network passphrase.
+///
+/// Testnet and futurenet each run their own friendbot deployment, and the
+/// futurenet one is a different host — `friendbot.stellar.org` is testnet-only
+/// (#471). Sending a futurenet account to the testnet friendbot either funds an
+/// account on the wrong network or fails outright, despite the error message
+/// below claiming futurenet is supported.
+///
+/// Returns `None` for a passphrase this crate does not know, so the caller can
+/// refuse rather than silently default to testnet.
+fn friendbot_host_for(passphrase: &str) -> Option<&'static str> {
+    if passphrase.contains("Public Global Stellar Network") {
+        // Mainnet — no friendbot exists at all.
+        None
+    } else if passphrase.contains("Future Network") {
+        Some("https://friendbot-futurenet.stellar.org")
+    } else if passphrase.contains("Test SDF Network") {
+        Some("https://friendbot.stellar.org")
+    } else {
+        // Standalone/local networks run their own friendbot; this crate has no
+        // way to guess its host, and guessing testnet would fund the wrong
+        // network.
+        None
+    }
+}
+
+/// Build the friendbot request URL for a network, or `None` when the network
+/// has no known friendbot.
+///
+/// Split out from [`fund_friendbot`] so the URL construction — which is the
+/// part that was wrong in #471 — is testable without making a network call.
+pub fn friendbot_url(public_key: &str, network_passphrase: Option<&str>) -> Option<String> {
+    let passphrase = network_passphrase?;
+    let host = friendbot_host_for(passphrase)?;
+    Some(format!("{host}/?addr={public_key}"))
+}
+
+/// Fund a Stellar testnet/futurenet account via friendbot.
 /// Returns the parsed balance (in XLM) on success.
 ///
-/// Refuses to run on mainnet (passphrase contains "Public Global Stellar Network").
-/// The request is bounded by `timeout` when set (`--timeout`).
+/// The friendbot host is chosen from the effective network passphrase (#471):
+/// testnet and futurenet have separate deployments. Mainnet, and any passphrase
+/// this crate does not recognize, is refused rather than silently funded on
+/// testnet. The request is bounded by `timeout` when set (`--timeout`).
 pub fn fund_friendbot(
     public_key: &str,
     network_passphrase: Option<&str>,
     timeout: Option<Duration>,
 ) -> Result<String> {
     // #287 — refuse to run on mainnet
-    if let Some(passphrase) = network_passphrase {
-        if passphrase.contains("Public Global Stellar Network") {
-            return Err(ForgeError::InvalidArgument(
-                "friendbot funding is only available on testnet/futurenet, not mainnet".into(),
-            ));
-        }
+    let Some(passphrase) = network_passphrase else {
+        return Err(ForgeError::InvalidArgument(
+            "friendbot funding needs a known network passphrase; \
+             set a network with `soroban-forge network use <name>`"
+                .into(),
+        ));
+    };
+    if passphrase.contains("Public Global Stellar Network") {
+        return Err(ForgeError::InvalidArgument(
+            "friendbot funding is only available on testnet/futurenet, not mainnet".into(),
+        ));
     }
 
-    let url = format!("https://friendbot.stellar.org/?addr={public_key}");
+    let Some(url) = friendbot_url(public_key, network_passphrase) else {
+        return Err(ForgeError::InvalidArgument(format!(
+            "no friendbot is known for the network passphrase {passphrase:?}; \
+             friendbot funding supports testnet and futurenet only"
+        )));
+    };
+
     log::debug!("requesting friendbot: {url}");
     let response = http_get(&url, timeout).map_err(|e| {
         // Surface actionable error messages (#287)
@@ -515,6 +565,71 @@ mod tests {
         );
     }
 
+    // #471 — the friendbot host is chosen per network, not hardcoded to testnet
+    #[test]
+    fn friendbot_host_is_chosen_per_network() {
+        // Testnet and futurenet run separate friendbot deployments.
+        assert_eq!(
+            friendbot_host_for("Test SDF Network ; September 2015"),
+            Some("https://friendbot.stellar.org")
+        );
+        assert_eq!(
+            friendbot_host_for("Test SDF Future Network ; October 2022"),
+            Some("https://friendbot-futurenet.stellar.org")
+        );
+    }
+
+    #[test]
+    fn friendbot_host_is_none_for_mainnet_and_unknown_networks() {
+        assert_eq!(friendbot_host_for("Public Global Stellar Network ; September 2015"), None);
+        // An unrecognized/custom passphrase must not silently fall back to the
+        // testnet friendbot — that would fund an account on the wrong network.
+        assert_eq!(friendbot_host_for("Standalone Network ; February 2017"), None);
+        assert_eq!(friendbot_host_for("Some Custom Network"), None);
+    }
+
+    #[test]
+    fn fund_friendbot_uses_the_futurenet_host_for_a_futurenet_passphrase() {
+        // The bug in #471 was that this request went to friendbot.stellar.org
+        // (testnet) regardless of the passphrase. Assert on the URL the
+        // function actually builds, without making the request.
+        let url = friendbot_url(
+            "GABC",
+            Some("Test SDF Future Network ; October 2022"),
+        )
+        .expect("futurenet should resolve to a friendbot host");
+        assert!(
+            url.starts_with("https://friendbot-futurenet.stellar.org/"),
+            "futurenet must use its own friendbot host, got {url}"
+        );
+        assert!(
+            !url.contains("//friendbot.stellar.org"),
+            "futurenet must not use the testnet friendbot, got {url}"
+        );
+    }
+
+    #[test]
+    fn fund_friendbot_refuses_a_custom_passphrase() {
+        // Not mainnet, but not a network with a known friendbot either: the
+        // error must say so rather than defaulting to testnet.
+        let result = fund_friendbot("GABC", Some("Standalone Network ; February 2017"), None);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Standalone Network"),
+            "error should name the unrecognized passphrase: {msg}"
+        );
+    }
+
+    #[test]
+    fn fund_friendbot_requires_a_passphrase() {
+        let result = fund_friendbot("GABC", None, None);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("passphrase"),
+            "error should explain a passphrase is needed: {msg}"
+        );
     // #470 — a crash mid-write must not corrupt the identity store
     #[test]
     fn save_store_replaces_the_file_atomically() {
