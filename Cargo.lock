@@ -1267,6 +1267,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "soroban-forge-core",
+ "stellar-strkey",
  "tempfile",
  "toml",
 ]
