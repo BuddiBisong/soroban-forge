@@ -714,8 +714,11 @@ pub fn run_checks_with_network(allow_network: bool) -> Vec<Check> {
             }
             Some(_) => Check {
                 name: "wasm32-unknown-unknown",
-                status: Status::Fail,
-                detail: "missing wasm32 target".into(),
+                // The legacy target is optional: wasm32v1-none is the required
+                // one and is checked separately. Missing this must not turn
+                // doctor's overall result into a failure (#484).
+                status: Status::Warn,
+                detail: "missing optional legacy wasm32 target".into(),
                 fix: Some("rustup target add wasm32-unknown-unknown"),
             },
             None => Check {
@@ -1329,6 +1332,45 @@ mod tests {
             fix: None,
         }];
         assert_eq!(failure_count(&checks), 0);
+    }
+
+    #[test]
+    fn missing_legacy_wasm_target_does_not_fail_the_run() {
+        // The legacy wasm32-unknown-unknown target is optional (#484): a project
+        // that only needs wasm32v1-none must not get a non-zero exit just because
+        // the older target is absent.
+        let legacy_missing = Check {
+            name: "wasm32-unknown-unknown",
+            status: Status::Warn,
+            detail: "missing optional legacy wasm32 target".into(),
+            fix: Some("rustup target add wasm32-unknown-unknown"),
+        };
+        let required_present = Check {
+            name: "wasm32v1-none-target",
+            status: Status::Pass,
+            detail: "installed".into(),
+            fix: None,
+        };
+
+        let checks = [required_present, legacy_missing];
+
+        assert_eq!(
+            failure_count(&checks),
+            0,
+            "a missing optional legacy target must not count as a failure"
+        );
+
+        // The report still mentions the warning, but it must not be reported as
+        // a failure - the warning is informational, not blocking.
+        let report = format_report(&checks);
+        assert!(
+            report.contains("0 failure(s), 1 warning(s)"),
+            "the legacy target must be reported as a warning, not a failure: {report}"
+        );
+        assert!(
+            !report.contains('\u{2717}'),
+            "no check may render as a failure marker: {report}"
+        );
     }
 
     // ---- wasm smoke-build check ----
