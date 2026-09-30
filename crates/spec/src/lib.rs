@@ -344,6 +344,8 @@ pub enum SpecFormat {
     Json,
     /// Markdown documentation table of entrypoints and referenced custom types.
     Markdown,
+    /// Raw XDR-base64 output from stellar CLI for tooling that needs it directly.
+    Xdr,
 }
 
 impl SpecFormat {
@@ -352,6 +354,7 @@ impl SpecFormat {
         match self {
             SpecFormat::Rust => "rust",
             SpecFormat::Json | SpecFormat::Markdown => "json-formatted",
+            SpecFormat::Xdr => "xdr-base64",
         }
     }
 
@@ -372,8 +375,9 @@ pub fn resolve_format(matches: &ArgMatches, ctx: &ForgeContext) -> Result<SpecFo
             "md" | "markdown" => Ok(SpecFormat::Markdown),
             "json" => Ok(SpecFormat::Json),
             "rust" | "text" => Ok(SpecFormat::Rust),
+            "xdr" => Ok(SpecFormat::Xdr),
             other => Err(ForgeError::InvalidArgument(format!(
-                "unsupported spec format `{other}`; expected `rust`, `json` or `md`"
+                "unsupported spec format `{other}`; expected `rust`, `json`, `xdr` or `md`"
             ))),
         }
     } else if ctx.json {
@@ -422,6 +426,17 @@ fn run_stellar_info(wasm: &Path, format: SpecFormat) -> Result<String> {
         }
         Err(e) => Err(ForgeError::io("running stellar contract info interface")(e)),
     }
+}
+
+/// Escape a contract-supplied identifier for use inside a Markdown table cell.
+///
+/// Names and types come from the contract's own wasm spec, so they are
+/// untrusted from this tool's point of view. A literal `|` would add a column
+/// and a backtick would close the inline-code span early, either of which
+/// breaks the generated table or lets contract text alter how the doc renders
+/// once embedded in a README (#483).
+fn escape_markdown_cell(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('|', "\\|").replace('`', "\\`")
 }
 
 /// Render a type definition into a compact, human-readable string.
@@ -669,23 +684,34 @@ pub fn render_markdown_spec(spec_json: &str) -> Result<String> {
             } else {
                 func.inputs
                     .iter()
-                    .map(|(n, t)| format!("`{n}: {t}`"))
+                    .map(|(n, t)| {
+                        format!(
+                            "`{}: {}`",
+                            escape_markdown_cell(n),
+                            escape_markdown_cell(t)
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(", ")
             };
             let ret_col = match func.outputs.as_slice() {
                 [] => "-".to_string(),
-                [single] => format!("`{single}`"),
+                [single] => format!("`{}`", escape_markdown_cell(single)),
                 many => {
                     let wrapped = many
                         .iter()
-                        .map(|t| format!("`{t}`"))
+                        .map(|t| format!("`{}`", escape_markdown_cell(t)))
                         .collect::<Vec<_>>()
                         .join(", ");
                     format!("({wrapped})")
                 }
             };
-            md.push_str(&format!("| `{}` | {} | {} |\n", func.name, args_col, ret_col));
+            md.push_str(&format!(
+                "| `{}` | {} | {} |\n",
+                escape_markdown_cell(&func.name),
+                args_col,
+                ret_col
+            ));
         }
     }
 
@@ -702,33 +728,49 @@ pub fn render_markdown_spec(spec_json: &str) -> Result<String> {
 
         for name in &referenced {
             if let Some(s) = structs.get(name) {
-                md.push_str(&format!("\n### `{name}` (Struct)\n\n"));
+                md.push_str(&format!("\n### `{}` (Struct)\n\n", escape_markdown_cell(name)));
                 md.push_str("| Field | Type |\n");
                 md.push_str("| --- | --- |\n");
                 for (fname, ftype) in &s.fields {
-                    md.push_str(&format!("| `{fname}` | `{ftype}` |\n"));
+                    md.push_str(&format!(
+                        "| `{}` | `{}` |\n",
+                        escape_markdown_cell(fname),
+                        escape_markdown_cell(ftype)
+                    ));
                 }
             } else if let Some(e) = enums.get(name) {
-                md.push_str(&format!("\n### `{name}` (Enum)\n\n"));
+                md.push_str(&format!("\n### `{}` (Enum)\n\n", escape_markdown_cell(name)));
                 md.push_str("| Variant | Value |\n");
                 md.push_str("| --- | --- |\n");
                 for (vname, vval) in &e.cases {
-                    md.push_str(&format!("| `{vname}` | `{vval}` |\n"));
+                    md.push_str(&format!(
+                        "| `{}` | `{vval}` |\n",
+                        escape_markdown_cell(vname)
+                    ));
                 }
             } else if let Some(err) = error_enums.get(name) {
-                md.push_str(&format!("\n### `{name}` (Error)\n\n"));
+                md.push_str(&format!("\n### `{}` (Error)\n\n", escape_markdown_cell(name)));
                 md.push_str("| Error | Code |\n");
                 md.push_str("| --- | --- |\n");
                 for (ename, eval) in &err.cases {
-                    md.push_str(&format!("| `{ename}` | `{eval}` |\n"));
+                    md.push_str(&format!(
+                        "| `{}` | `{eval}` |\n",
+                        escape_markdown_cell(ename)
+                    ));
                 }
             } else if let Some(u) = unions.get(name) {
-                md.push_str(&format!("\n### `{name}` (Union)\n\n"));
+                md.push_str(&format!("\n### `{}` (Union)\n\n", escape_markdown_cell(name)));
                 md.push_str("| Case | Type |\n");
                 md.push_str("| --- | --- |\n");
                 for (cname, ctype) in &u.cases {
-                    let type_cell = ctype.as_deref().map(|t| format!("`{t}`")).unwrap_or_else(|| "-".into());
-                    md.push_str(&format!("| `{cname}` | {type_cell} |\n"));
+                    let type_cell = ctype
+                        .as_deref()
+                        .map(|t| format!("`{}`", escape_markdown_cell(t)))
+                        .unwrap_or_else(|| "-".into());
+                    md.push_str(&format!(
+                        "| `{}` | {type_cell} |\n",
+                        escape_markdown_cell(cname)
+                    ));
                 }
             }
         }
@@ -771,6 +813,76 @@ pub fn format_header_label(label: &str) -> String {
     format!("contract interface — {label}\n\n")
 }
 
+/// Filter a JSON spec string to include only the entry for `name`.
+///
+/// Returns `Ok(Some(entry_json))` when found, `Ok(None)` when the spec is
+/// empty JSON (so callers can distinguish "no functions at all" from
+/// "function not found"), or `Err` when `spec_json` is not valid JSON.
+///
+/// On a miss, also returns the list of available entrypoint names so the
+/// error message can suggest what is there.
+pub fn find_entrypoint_in_spec(
+    spec_json: &str,
+    name: &str,
+) -> Result<std::result::Result<serde_json::Value, Vec<String>>> {
+    let entries: serde_json::Value = serde_json::from_str(spec_json)
+        .map_err(|e| ForgeError::InvalidArgument(format!("could not parse contract spec JSON: {e}")))?;
+    let entries = entries
+        .as_array()
+        .ok_or_else(|| ForgeError::InvalidArgument("contract spec JSON is not an array".into()))?;
+
+    let mut available: Vec<String> = Vec::new();
+    for entry in entries {
+        if let Some(function) = entry.get("function_v0") {
+            let fn_name = function
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if fn_name == name {
+                return Ok(Ok(entry.clone()));
+            }
+            available.push(fn_name.to_string());
+        }
+    }
+    Ok(Err(available))
+}
+
+/// Format the single-entrypoint JSON as the output mode requires.
+///
+/// For `SpecFormat::Json` the raw JSON entry is printed.
+/// For `SpecFormat::Rust` / `SpecFormat::Markdown` the single entry is
+/// re-wrapped in an array so the existing helpers receive a valid spec
+/// document.
+pub fn format_single_entrypoint(entry: &serde_json::Value, format: SpecFormat) -> Result<String> {
+    match format {
+        SpecFormat::Json => Ok(serde_json::to_string_pretty(entry)
+            .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+            + "\n"),
+        SpecFormat::Rust | SpecFormat::Markdown => {
+            // Re-wrap as a one-element array so `render_markdown_spec` and
+            // the Rust listing path both work without modification.
+            let wrapped = serde_json::to_string(&serde_json::Value::Array(vec![entry.clone()]))
+                .map_err(|e| ForgeError::Other(format!("serialising entry: {e}")))?;
+            match format {
+                SpecFormat::Markdown => render_markdown_spec(&wrapped),
+                _ => {
+                    // For the Rust listing we still need the JSON; the stellar
+                    // CLI emits the Rust listing natively, so we cannot
+                    // reconstruct it without calling `stellar`. Return the
+                    // entry signature as a plain text line instead.
+                    let sig = entrypoint_signature(entry)?;
+                    let name = entry
+                        .get("function_v0")
+                        .and_then(|f| f.get("name"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?");
+                    Ok(format!("fn {name}{sig}\n"))
+                }
+            }
+        }
+    }
+}
+
 /// The `spec` subcommand.
 pub struct SpecPlugin;
 
@@ -789,6 +901,7 @@ impl ForgePlugin for SpecPlugin {
                  When a contract ID is provided, fetches the deployed wasm from the \
                  network first. Otherwise reads the spec out of the built wasm \
                  (run `stellar contract build` first).\n\n\
+                 Pass --entrypoint <NAME> to print only that one function signature. \
                  Pass --format md to render documentation-ready Markdown tables, or \
                  the global --json flag for machine-readable output.",
             )
@@ -810,8 +923,20 @@ impl ForgePlugin for SpecPlugin {
             .arg(
                 Arg::new("format")
                     .long("format")
-                    .value_parser(["rust", "text", "json", "md", "markdown"])
-                    .help("Output format: rust (default), json, or md for Markdown tables"),
+                    .value_parser(["rust", "text", "json", "md", "markdown", "xdr"])
+                    .help("Output format: rust (default), json, xdr, or md for Markdown tables"),
+            )
+            .arg(
+                Arg::new("contract")
+                    .long("contract")
+                    .help("Contract name to target in a multi-contract workspace [default: the only contract if unique]"),
+            )
+            .arg(
+                Arg::new("entrypoint")
+                    .long("entrypoint")
+                    .short('e')
+                    .value_name("NAME")
+                    .help("Print only the signature of this one entrypoint; fails with the available list if not found"),
             )
             .arg(
                 Arg::new("network")
@@ -892,6 +1017,7 @@ impl ForgePlugin for SpecPlugin {
         }
 
         let format = resolve_format(matches, ctx)?;
+        let entrypoint_filter = matches.get_one::<String>("entrypoint").cloned();
 
         let network = NetworkArgs::resolve(
             matches.get_one::<String>("network").cloned(),
@@ -899,13 +1025,21 @@ impl ForgePlugin for SpecPlugin {
             matches.get_one::<String>("network-passphrase").cloned(),
         );
 
+        // When --entrypoint is given we always need the JSON form of the full
+        // spec so we can filter it; the final output format is applied after.
+        let fetch_format = if entrypoint_filter.is_some() {
+            SpecFormat::Json
+        } else {
+            format
+        };
+
         let (source_label, interface) = match contract_id {
             Some(id) => {
                 let temp = tempfile::tempdir()
                     .map_err(ForgeError::io("creating temporary directory"))?;
                 let fetched_wasm = temp.path().join("onchain.wasm");
                 fetch_onchain_wasm(id, &network, &fetched_wasm, ctx.timeout())?;
-                let output = dump_interface_from_wasm(&fetched_wasm, format)?;
+                let output = dump_interface_from_wasm(&fetched_wasm, fetch_format)?;
                 (id.clone(), output)
             }
             None => {
@@ -914,10 +1048,34 @@ impl ForgePlugin for SpecPlugin {
                     .map(|p| ctx.cwd.join(p))
                     .unwrap_or_else(|| ctx.cwd.clone());
                 let wasm_override = matches.get_one::<String>("wasm").map(|p| ctx.cwd.join(p));
-                let (wasm_path, output) = dump_interface(&dir, wasm_override.as_deref(), format)?;
+                let (wasm_path, output) = dump_interface(&dir, wasm_override.as_deref(), fetch_format)?;
                 (wasm_path.display().to_string(), output)
             }
         };
+
+        // --entrypoint: filter to one function and re-format.
+        if let Some(ref name) = entrypoint_filter {
+            let lookup = find_entrypoint_in_spec(&interface, name)?;
+            let entry = match lookup {
+                Ok(entry) => entry,
+                Err(available) => {
+                    let list = if available.is_empty() {
+                        "no entrypoints defined".to_string()
+                    } else {
+                        format!("available entrypoints: {}", available.join(", "))
+                    };
+                    return Err(ForgeError::InvalidArgument(format!(
+                        "entrypoint `{name}` not found in the contract interface; {list}"
+                    )));
+                }
+            };
+            let output = format_single_entrypoint(&entry, format)?;
+            print!("{output}");
+            if !output.ends_with('\n') {
+                println!();
+            }
+            return Ok(());
+        }
 
         if ctx.json || format == SpecFormat::Json {
             print!("{interface}");
@@ -1257,6 +1415,88 @@ mod tests {
         assert!(!md.contains("UnusedError"));
     }
 
+    // -----------------------------------------------------------------------
+    // Issue #279 — --entrypoint
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn find_entrypoint_returns_matching_entry() {
+        let spec_json = serde_json::json!([
+            { "function_v0": { "name": "transfer", "inputs": [{"name":"to","type":"address"},{"name":"amount","type":"i128"}], "outputs": [] } },
+            { "function_v0": { "name": "balance",  "inputs": [{"name":"id","type":"address"}], "outputs": ["i128"] } }
+        ]);
+        let json = serde_json::to_string(&spec_json).unwrap();
+        let result = find_entrypoint_in_spec(&json, "transfer").unwrap();
+        let entry = result.unwrap();
+        assert_eq!(
+            entry["function_v0"]["name"].as_str().unwrap(),
+            "transfer"
+        );
+    }
+
+    #[test]
+    fn find_entrypoint_returns_available_list_on_miss() {
+        let spec_json = serde_json::json!([
+            { "function_v0": { "name": "transfer", "inputs": [], "outputs": [] } },
+            { "function_v0": { "name": "balance",  "inputs": [], "outputs": [] } }
+        ]);
+        let json = serde_json::to_string(&spec_json).unwrap();
+        let result = find_entrypoint_in_spec(&json, "mint").unwrap();
+        let available = result.unwrap_err();
+        assert!(available.contains(&"transfer".to_string()));
+        assert!(available.contains(&"balance".to_string()));
+    }
+
+    #[test]
+    fn find_entrypoint_empty_spec_returns_empty_list() {
+        let json = "[]";
+        let result = find_entrypoint_in_spec(json, "anything").unwrap();
+        let available = result.unwrap_err();
+        assert!(available.is_empty());
+    }
+
+    #[test]
+    fn format_single_entrypoint_json_is_pretty_printed() {
+        let entry = serde_json::json!({
+            "function_v0": {
+                "name": "transfer",
+                "inputs": [{"name":"to","type":"address"}],
+                "outputs": []
+            }
+        });
+        let out = format_single_entrypoint(&entry, SpecFormat::Json).unwrap();
+        // Must be valid JSON
+        let _: serde_json::Value = serde_json::from_str(&out.trim()).unwrap();
+        assert!(out.contains("transfer"));
+    }
+
+    #[test]
+    fn format_single_entrypoint_rust_contains_fn_signature() {
+        let entry = serde_json::json!({
+            "function_v0": {
+                "name": "transfer",
+                "inputs": [{"name":"to","type":"address"},{"name":"amount","type":"i128"}],
+                "outputs": []
+            }
+        });
+        let out = format_single_entrypoint(&entry, SpecFormat::Rust).unwrap();
+        assert!(out.contains("transfer"), "{out}");
+        assert!(out.contains("to"), "{out}");
+        assert!(out.contains("amount"), "{out}");
+    }
+
+    #[test]
+    fn command_exposes_entrypoint_flag() {
+        let matches = SpecPlugin
+            .command()
+            .try_get_matches_from(vec!["spec", "--entrypoint", "transfer"])
+            .unwrap();
+        assert_eq!(
+            matches.get_one::<String>("entrypoint").map(String::as_str),
+            Some("transfer")
+        );
+    }
+
     #[test]
     fn transitively_referenced_types_are_included() {
         let spec_json = serde_json::json!([
@@ -1290,5 +1530,89 @@ mod tests {
         let md = render_markdown_spec(&serde_json::to_string(&spec_json).unwrap()).unwrap();
         assert!(md.contains("### `Batch` (Struct)"));
         assert!(md.contains("### `Item` (Struct)"));
+    }
+
+    #[test]
+    fn markdown_tables_escape_pipes_and_backticks_in_identifiers() {
+        // Contract-supplied names are untrusted input (#483): a literal `|` adds
+        // a column and a backtick ends the inline-code span early, so both must
+        // be escaped before they reach a table cell.
+        let spec_json = serde_json::json!([
+            {
+                "function_v0": {
+                    "name": "pip|e",
+                    "inputs": [
+                        { "name": "we|ird", "type": "u64" },
+                        { "name": "tick`y", "type": "bool" },
+                        { "name": "p", "type": { "udt": { "name": "Pi|pe" } } }
+                    ],
+                    "outputs": ["str|ing"]
+                }
+            },
+            {
+                "udt_struct_v0": {
+                    "name": "Pi|pe",
+                    "fields": [
+                        { "name": "fie|ld", "type": "u32" },
+                        { "name": "back`tick", "type": "u32" }
+                    ]
+                }
+            }
+        ]);
+
+        let md = render_markdown_spec(&serde_json::to_string(&spec_json).unwrap()).unwrap();
+
+        // The raw characters must not appear unescaped anywhere in the output.
+        assert!(
+            !md.contains("pip|e"),
+            "an unescaped pipe in a function name would add a table column"
+        );
+        assert!(
+            !md.contains("Pi|pe"),
+            "an unescaped pipe in a type name would add a table column"
+        );
+        assert!(
+            !md.contains("fie|ld"),
+            "an unescaped pipe in a field name would add a table column"
+        );
+        assert!(
+            !md.contains("back`tick"),
+            "an unescaped backtick in a field name would end the code span early"
+        );
+
+        // Every table row must have the same number of cells as its own header.
+        // Each table is checked separately: the entrypoints table has 3 columns
+        // and the custom-type tables have 2, so a single global count would be
+        // wrong. An escaped `\|` is content, not a separator, so it is masked
+        // before counting.
+        let mut current_table_cells: Option<usize> = None;
+        let mut tables_checked = 0;
+        for line in md.lines() {
+            if !line.starts_with('|') {
+                // A blank line or a heading ends the current table.
+                current_table_cells = None;
+                continue;
+            }
+            let cells = line.replace(r"\|", "\u{0}").split('|').count();
+            match current_table_cells {
+                None => {
+                    current_table_cells = Some(cells);
+                    tables_checked += 1;
+                }
+                Some(expected) => assert_eq!(
+                    cells, expected,
+                    "table row {line:?} has {cells} cells, expected {expected} - the table is malformed"
+                ),
+            }
+        }
+        assert!(
+            tables_checked >= 2,
+            "expected at least the entrypoints and struct tables, found {tables_checked}"
+        );
+
+        // The escaped forms are still present, so nothing was silently dropped.
+        assert!(md.contains(r"pip\|e"));
+        assert!(md.contains(r"fie\|ld"));
+        assert!(md.contains(r"back\`tick"));
     }
 }

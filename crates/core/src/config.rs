@@ -30,6 +30,25 @@ pub struct ForgeConfig {
     pub defaults: DefaultsConfig,
     #[serde(default)]
     pub network: NetworkConfig,
+    #[serde(default)]
+    pub bindings: BindingsConfig,
+}
+
+/// `[bindings]` section — top-level bindings configuration.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+pub struct BindingsConfig {
+    /// Settings for the `bindings ts` subcommand.
+    #[serde(default, rename = "ts")]
+    pub ts: BindingsTsConfig,
+}
+
+/// `[bindings.ts]` section — TypeScript binding generation settings.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+pub struct BindingsTsConfig {
+    /// Default output directory for the generated TypeScript package,
+    /// relative to the contract project directory.
+    /// Overridden at the command line by `--out-dir` / `--output`.
+    pub output: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Deserialize)]
@@ -216,6 +235,7 @@ max_size = 65536
             "[network] name",
             "[network] rpc_url",
             "[network] passphrase",
+            "[bindings.ts] output",
         ];
         for key in keys {
             let needle = format!("`{key}`");
@@ -254,6 +274,14 @@ pub fn unknown_keys(raw: &str) -> std::result::Result<Vec<String>, toml::de::Err
                 if let toml::Value::Table(table) = value {
                     if let Some(ci_init) = table.get("ci-init").or_else(|| table.get("ci_init")) {
                         collect_strays(ci_init, &["max_size"], "defaults.ci-init", &mut strays);
+                    }
+                }
+            }
+            "bindings" => {
+                collect_strays(value, &["ts"], "bindings", &mut strays);
+                if let toml::Value::Table(table) = value {
+                    if let Some(ts) = table.get("ts") {
+                        collect_strays(ts, &["output"], "bindings.ts", &mut strays);
                     }
                 }
             }
@@ -342,6 +370,13 @@ pub fn resolved_report(config: &Option<ForgeConfig>) -> String {
         Some(max_size) => out.push_str(&format!("max_size = {max_size}\n")),
         None => out.push_str("# max_size = (unset)\n"),
     }
+
+    out.push_str("\n[bindings.ts]\n");
+    match &config.bindings.ts.output {
+        Some(output) => out.push_str(&format!("output = \"{output}\"\n")),
+        None => out.push_str("# output = (unset, defaults to \"bindings/typescript\")\n"),
+    }
+
     out
 }
 
@@ -359,6 +394,8 @@ mod resolved_tests {
         assert!(report.contains("[defaults.ci-init]"));
         assert!(report.contains("# max_size = (unset)"));
         assert!(report.contains("update_check = true"));
+        assert!(report.contains("[bindings.ts]"));
+        assert!(report.contains("# output = (unset"));
     }
 
     #[test]
@@ -410,5 +447,28 @@ mod resolved_tests {
     #[test]
     fn empty_file_produces_no_warnings() {
         assert!(unknown_keys("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parses_bindings_ts_output() {
+        let config: ForgeConfig =
+            toml::from_str("[bindings.ts]\noutput = \"packages/client\"\n").unwrap();
+        assert_eq!(
+            config.bindings.ts.output.as_deref(),
+            Some("packages/client")
+        );
+    }
+
+    #[test]
+    fn bindings_ts_output_unknown_key_is_flagged() {
+        let strays =
+            unknown_keys("[bindings.ts]\noutput = \"custom/dir\"\ntypo = \"oops\"\n").unwrap();
+        assert_eq!(strays, vec!["bindings.ts.typo"]);
+    }
+
+    #[test]
+    fn valid_bindings_ts_output_produces_no_warnings() {
+        let strays = unknown_keys("[bindings.ts]\noutput = \"custom/dir\"\n").unwrap();
+        assert!(strays.is_empty());
     }
 }
