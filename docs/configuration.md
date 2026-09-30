@@ -12,3 +12,31 @@
 | `--offline` | `SOROBAN_FORGE_OFFLINE` | `false` | No network |
 
 Precedence: CLI flag > env var > forge.toml > default.
+
+## `forge.toml` reference
+
+Every key any command actually reads from the optional `forge.toml` project
+file — one row per key, generated from an audit of `ctx.config` usage across
+every crate (not just `soroban-forge-core::config::ForgeConfig`; `optimize`
+parses its own `[optimize]` section directly). `crates/core/src/config.rs`
+tests (`unknown_keys`) flag anything else in the file as an unrecognized key.
+
+| Key | Type | Default | Read by |
+|-----|------|---------|---------|
+| `[project] name` | string | none (falls back to `Cargo.toml`'s `[package] name`, or the directory name) | `ci-init` (default project name for generated workflow templates); also shown by `config` |
+| `[project] authors` | array of strings | `[]` | `new` (first entry seeds the generated `Cargo.toml`'s author, via `ForgeConfig::author()`; falls back to the local git identity, then a placeholder, when unset); also shown by `config` |
+| `[scaffold] default_template` | string | `"hello-world"` | `new` (default `--template` when the flag is omitted); also shown by `config` |
+| `[defaults] timeout_secs` | integer (seconds) | none | **none** — parsed and printed by `config`, but no command ever applies it; the timeout commands actually honor (`ctx.timeout()`) comes only from the `--timeout` flag / `SOROBAN_FORGE_TIMEOUT` |
+| `[defaults] max_size` | integer (bytes) | none | **none** — parsed and printed by `config`, but no command applies it. This is *not* the wasm-size budget `optimize --check` enforces; that's the separate `[optimize] max-size` key below |
+| `[defaults] update_check` | boolean | `true` | Persistent opt-out for the release-version check. Set to `false` to disable the background check on every invocation. Can also be suppressed per-session with `SOROBAN_FORGE_NO_UPDATE_CHECK=1` or `--offline` |
+| `[defaults.ci-init] max_size` (TOML key `ci-init`, alias `ci_init`) | integer (bytes) | `65536` | `ci-init` (default for `--max-size`, used in the generated `contract-size`/Buildkite pipeline's size check) |
+| `[network] name` | string | none (falls back to `"testnet"`, [`DEFAULT_NETWORK`](../crates/verify/src/lib.rs)) | `network use` (writes this key); `deploy`, `invoke`, `verify` (default `--network` via `NetworkArgs::resolve`, CLI flags win); `doctor` (health-check target) |
+| `[network] rpc_url` | string | none | `deploy`, `invoke`, `verify` (default `--rpc-url` via `NetworkArgs::resolve`); `doctor` (health-check endpoint) |
+| `[network] passphrase` | string | none | `deploy`, `invoke`, `verify` (default `--network-passphrase` via `NetworkArgs::resolve`); `identity fund` (refuses to run against a passphrase containing `"Public Global Stellar Network"`, i.e. mainnet) |
+| `[optimize] max-size` (alias `max_size`) | integer (bytes) | none | `optimize --check` (fails when the built wasm exceeds this). Read directly from `forge.toml` by `soroban-forge-optimize`, independent of `ForgeConfig` above — so it is *not* covered by `config`'s unknown-key warning or its resolved-config printout |
+| `[bindings.ts] output` | string (path) | `"bindings/typescript"` | `bindings ts` (default output directory for the generated TypeScript package, relative to the contract project directory; overridden by `--out-dir` / `--output` on the command line) |
+
+`[defaults] timeout_secs` and `[defaults] max_size` are parsed and echoed
+by `soroban-forge config` even though nothing currently consults them —
+they're dead configuration, kept here for accuracy rather than silently
+dropped from the table.

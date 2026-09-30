@@ -12,6 +12,7 @@
 //! crate and implement [`ForgePlugin`]; the `soroban-forge` binary wires them
 //! together and calls [`run`].
 
+pub mod atomic;
 pub mod cli;
 pub mod config;
 pub mod config_cmd;
@@ -19,6 +20,8 @@ pub mod error;
 pub mod logging;
 pub mod plugin;
 pub mod render; // template renderer
+pub mod timeout;
+pub mod toolchain;
 
 pub use cli::run;
 pub use config::ForgeConfig;

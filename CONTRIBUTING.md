@@ -3,6 +3,9 @@
 Thanks for helping! This project is deliberately structured so five people (or
 five hundred) can work in parallel with minimal merge conflicts.
 
+Everyone taking part is expected to follow the
+[Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## Module ownership map
 
 | module | paths | owner | subcommand |
@@ -15,6 +18,11 @@ five hundred) can work in parallel with minimal merge conflicts.
 | 6 — TypeScript bindings generator | `crates/bindings-ts` | Person F | `bindings ts` |
 | 7 — Deployment verification | `crates/verify` | Person G | `verify` |
 | 8 — Contract interface dump | `crates/spec` | Person H | `spec` |
+| 9 — Python bindings generator | `crates/binding-py` | Person I | `bindings-py` |
+
+Modules 6 and 9 share the `module:bindings` GitHub label (see
+`.github/labeler.yml`) — they're two crates and two subcommands, but one
+conceptual "bindings generators" module for labelling purposes.
 
 Rules of the road:
 
@@ -41,6 +49,11 @@ pub trait ForgePlugin {
 
 Adding a whole new module = new crate + one `Box::new(...)` line in
 `src/main.rs`.
+
+Don't want to become a first-party module? `soroban-forge` also discovers
+any `soroban-forge-<name>` binary on `PATH` as a third-party subcommand —
+see [docs/plugin-tutorial.md](docs/plugin-tutorial.md) for a full,
+compiling walkthrough of building one outside this repo.
 
 ## Development
 
@@ -113,6 +126,17 @@ would treat the template as a real package.
 `trivial` / `medium` / `high`. Comment on the GitHub issue to claim it. PRs
 should include tests and update the owning module's README when the public
 surface changes.
+
+New issues go through the bug report and feature request forms, which ask
+for the module and apply its `module:*` label automatically. The PR template
+has the checklist reviewers expect: tests, module README updates, docs and a
+`CHANGELOG.md` entry under `[Unreleased]`.
+
+## Releasing
+
+Maintainers: the full release sequence (version bump, changelog cut,
+tagging and publishing) and which parts are automated is documented in
+[docs/releasing.md](docs/releasing.md).
 
 ## License
 

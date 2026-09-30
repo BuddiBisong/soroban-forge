@@ -9,5 +9,11 @@ rust-version.workspace = true
 
 [dependencies]
 soroban-forge-core.workspace = true
+soroban-forge-deploy.workspace = true
 clap.workspace = true
 log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

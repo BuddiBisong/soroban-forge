@@ -13,7 +13,7 @@ pub type Result<T> = std::result::Result<T, ForgeError>; // common Result alias
 /// |------|----------------|--------------------------------------------------------------------|
 /// | 0    | success        | the subcommand completed without error                             |
 /// | 1    | user error     | bad arguments, invalid config/template, output path exists without `--force`, a `verify` hash mismatch |
-/// | 2    | tool missing   | a required external tool is missing or fails its version check     |
+/// | 2    | tool missing   | a required external tool is missing, below the minimum version, or a known-broken release — anything `soroban-forge doctor` would flag |
 /// | 3    | internal error | an I/O failure, or anything not classified above                   |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
@@ -55,6 +55,11 @@ pub enum ForgeError {
     #[error("verification failed: {0}")]
     VerificationFailed(String),
 
+    /// The optimized wasm exceeds the size budget requested via
+    /// `optimize --check --max-size` or `forge.toml`.
+    #[error("optimized wasm size {actual} exceeds budget of {max} bytes")]
+    SizeBudgetExceeded { actual: u64, max: u64 },
+
     /// A required external tool (e.g. `stellar`, `rustc`, `rustup`) was not
     /// found on `PATH`, or failed its minimum-version check. Distinct from
     /// [`ForgeError::Doctor`] so a plugin that shells out to a specific tool
@@ -62,6 +67,13 @@ pub enum ForgeError {
     /// the `doctor` subcommand's aggregate report.
     #[error("{0} not found on PATH (run `soroban-forge doctor` for install instructions)")]
     ToolMissing(String),
+
+    /// A required external tool is present but unusable — below the minimum
+    /// supported version, or a known-broken release.  Exits with the same
+    /// code as [`ForgeError::ToolMissing`] because the remedy is the same:
+    /// fix the toolchain, then confirm with `soroban-forge doctor`.
+    #[error("{0} (run `soroban-forge doctor` for details)")]
+    ToolUnsupported(String),
 
     #[error("{context}: {source}")]
     Io {
@@ -89,8 +101,11 @@ impl ForgeError {
             | ForgeError::Template(_)
             | ForgeError::AlreadyExists(_)
             | ForgeError::InvalidArgument(_)
-            | ForgeError::VerificationFailed(_) => ExitCode::UserError,
-            ForgeError::Doctor(_) | ForgeError::ToolMissing(_) => ExitCode::ToolMissing,
+            | ForgeError::VerificationFailed(_)
+            | ForgeError::SizeBudgetExceeded { .. } => ExitCode::UserError,
+            ForgeError::Doctor(_)
+            | ForgeError::ToolMissing(_)
+            | ForgeError::ToolUnsupported(_) => ExitCode::ToolMissing,
             ForgeError::Io { .. } | ForgeError::Other(_) => ExitCode::InternalError,
         }
     }
@@ -130,6 +145,10 @@ mod tests {
             ForgeError::VerificationFailed("hash mismatch".into()).exit_code(),
             ExitCode::UserError
         );
+        assert_eq!(
+            ForgeError::SizeBudgetExceeded { actual: 100, max: 64 }.exit_code(),
+            ExitCode::UserError
+        );
     }
 
     #[test]
@@ -142,6 +161,16 @@ mod tests {
             ForgeError::ToolMissing("stellar".into()).exit_code(),
             ExitCode::ToolMissing
         );
+        assert_eq!(
+            ForgeError::ToolUnsupported("stellar-cli 20.0.0 is too old".into()).exit_code(),
+            ExitCode::ToolMissing
+        );
+    }
+
+    #[test]
+    fn missing_tool_error_points_to_doctor() {
+        let error = ForgeError::ToolMissing("stellar-cli".into());
+        assert!(error.to_string().contains("soroban-forge doctor"));
     }
 
     #[test]
@@ -175,11 +204,23 @@ mod tests {
             ForgeError::InvalidArgument("x".into()),
             ForgeError::Doctor("x".into()),
             ForgeError::VerificationFailed("x".into()),
+            ForgeError::SizeBudgetExceeded { actual: 1, max: 2 },
             ForgeError::ToolMissing("stellar".into()),
+            ForgeError::ToolUnsupported("stellar-cli 20.0.0 is too old".into()),
             ForgeError::Other("x".into()),
         ];
         for error in errors {
             let _ = error.exit_code();
         }
+    }
+
+    #[test]
+    fn tool_unsupported_message_points_at_doctor() {
+        let err = ForgeError::ToolUnsupported(
+            "stellar-cli 20.0.0 is too old for `optimize` (need >= 21.0)".into(),
+        );
+        let rendered = err.to_string();
+        assert!(rendered.contains("soroban-forge doctor"), "{rendered}");
+        assert!(rendered.contains("20.0.0"), "{rendered}");
     }
 }

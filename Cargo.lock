@@ -909,6 +909,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ryu"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -950,6 +956,7 @@ version = "1.0.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",
@@ -964,6 +971,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "serde_yaml"
+version = "0.9.34+deprecated"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
 ]
 
 [[package]]
@@ -1010,6 +1030,7 @@ version = "0.1.0"
 dependencies = [
  "clap_complete",
  "serde_json",
+ "soroban-forge-bindings-py",
  "soroban-forge-bindings-ts",
  "soroban-forge-ci-presets",
  "soroban-forge-core",
@@ -1026,6 +1047,20 @@ dependencies = [
  "soroban-forge-testgen",
  "soroban-forge-verify",
  "tempfile",
+]
+
+[[package]]
+name = "soroban-forge-bindings-py"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "log",
+ "serde",
+ "serde_json",
+ "soroban-forge-core",
+ "stellar-strkey",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]
@@ -1050,6 +1085,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "serde_yaml",
  "soroban-forge-core",
  "tempfile",
  "toml",
@@ -1074,12 +1110,14 @@ name = "soroban-forge-deploy"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "dirs",
  "log",
  "serde",
  "serde_json",
  "soroban-forge-core",
  "tempfile",
  "toml",
+ "ureq",
 ]
 
 [[package]]
@@ -1091,6 +1129,7 @@ dependencies = [
  "serde",
  "serde_json",
  "soroban-forge-core",
+ "soroban-forge-network",
  "soroban-forge-scaffold",
  "tempfile",
  "toml",
@@ -1134,7 +1173,10 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "log",
+ "serde",
+ "serde_json",
  "soroban-forge-core",
+ "tempfile",
 ]
 
 [[package]]
@@ -1226,6 +1268,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "soroban-forge-core",
+ "stellar-strkey",
  "tempfile",
  "toml",
 ]
@@ -1383,6 +1426,12 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"

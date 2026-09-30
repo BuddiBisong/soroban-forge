@@ -23,5 +23,14 @@ The other providers each carry a single build+test file mirroring
 `build-test.yml`: `gitlab/.gitlab-ci.yml`, `circleci/config.yml` and
 `bitbucket/bitbucket-pipelines.yml`.
 
+`buildkite/pipeline.yml` additionally mirrors `contract-size.yml`'s size
+check (a self-contained pass/fail against `MAX_WASM_BYTES`, without the
+GitHub-specific PR-diff/comment step): a `build-and-test` step running
+`cargo test` and the wasm release build, and a `contract-size` step —
+keyed with `depends_on` so it only runs after the build succeeds — that
+fails when the built wasm exceeds `MAX_WASM_BYTES`. Lands at
+`.buildkite/pipeline.yml`, following Buildkite's own convention of putting
+the pipeline under a `.buildkite/` directory at the project root.
+
 Templates may use `{{project_name}}` / `{{crate_name}}` / `{{msrv}}`; GitHub's
 own `${{ ... }}` expressions pass through rendering untouched.

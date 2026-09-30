@@ -5,7 +5,11 @@
 //! Unknown subcommands are dispatched to a `soroban-forge-<name>` binary on
 //! PATH (like cargo).  The external binary inherits our stdio and receives
 //! everything after the subcommand name on the original argv.  Global flags
-//! consumed by `soroban-forge` *before* the subcommand name are not forwarded.
+//! consumed by `soroban-forge` *before* the subcommand name are forwarded as
+//! environment variables following the `SOROBAN_FORGE_*` convention:
+//! `--verbose`/`-v` → `SOROBAN_FORGE_VERBOSE=1`, `--quiet` →
+//! `SOROBAN_FORGE_QUIET=1`, `--json` → `SOROBAN_FORGE_JSON=1` and `--yes` →
+//! `SOROBAN_FORGE_YES=1`.
 
 use std::ffi::OsStr;
 
@@ -13,6 +17,26 @@ use clap::{Arg, ArgAction, ArgMatches, Command};
 
 use crate::error::{ForgeError, Result};
 use crate::plugin::{ForgeContext, ForgePlugin};
+use crate::timeout::parse_timeout_secs;
+
+/// The soroban-sdk version pinned into generated projects — kept in sync with
+/// `soroban_forge_scaffold::SOROBAN_SDK_VERSION` via a build-time constant.
+/// Duplicated here so core does not depend on scaffold.
+pub const SDK_VERSION: &str = "26.1.0";
+
+/// Build the extended version string shown by `--version`:
+///   `<pkg-version> (commit <hash>, soroban-sdk <sdk>)`
+fn version_string() -> &'static str {
+    // Use a `Box::leak` so we can return a `&'static str` without a global.
+    let git_hash = option_env!("SOROBAN_FORGE_GIT_HASH").unwrap_or("unknown");
+    let s = format!(
+        "{} (commit {}, soroban-sdk {})",
+        env!("CARGO_PKG_VERSION"),
+        git_hash,
+        SDK_VERSION,
+    );
+    Box::leak(s.into_boxed_str())
+}
 
 
 /// Levenshtein edit distance.
@@ -35,20 +59,39 @@ pub fn closest_match<'a>(input: &str, candidates: &[&'a str], threshold: usize) 
     candidates.iter().map(|c| (*c, edit_distance(input, c))).filter(|(_, d)| *d <= threshold).min_by_key(|(_, d)| *d).map(|(c, _)| c)
 }
 pub fn env_flag(name: &str) -> bool {
-    std::env::var(name).map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes")).unwrap_or(false)
+    if let Ok(v) = std::env::var(name) {
+        let lower = v.to_ascii_lowercase();
+        match lower.as_str() {
+            "1" | "true" | "yes" => true,
+            "0" | "false" | "no" => false,
+            _ if !v.is_empty() => {
+                log::warn!("environment variable {}={} is not recognized; treating as false", name, v);
+                false
+            }
+            _ => false,
+        }
+    } else {
+        false
+    }
 }
 
 /// Build the top-level `soroban-forge` command from the registered plugins.
 pub fn build_command(plugins: &[Box<dyn ForgePlugin>]) -> Command {
+    let version_str = version_string();
     let mut cmd = Command::new("soroban-forge")
-        .version(env!("CARGO_PKG_VERSION"))
+        .version(version_str)
         .about(
             "Scaffolding, test-harness and CI toolkit for Soroban smart contracts on Stellar (CLI)",
         )
         .subcommand_required(false)
         .arg_required_else_help(true)
         .allow_external_subcommands(true)
-        .after_help("See all installed subcommands with `soroban-forge --list`")
+        .after_help(
+            "See all installed subcommands with `soroban-forge --list`\n\n\
+             Global flags given before an external subcommand (--verbose, --quiet, --json, --yes) \
+             are forwarded to it as SOROBAN_FORGE_VERBOSE, SOROBAN_FORGE_QUIET, SOROBAN_FORGE_JSON \
+             and SOROBAN_FORGE_YES environment variables.",
+        )
         .arg(
             Arg::new("list")
                 .long("list")
@@ -116,11 +159,27 @@ pub fn build_command(plugins: &[Box<dyn ForgePlugin>]) -> Command {
                 .help("Disable all network access"),
         )
         .arg(
+            Arg::new("color")
+                .long("color")
+                .global(true)
+                .value_name("WHEN")
+                .value_parser(["auto", "always", "never"])
+                .default_value("auto")
+                .help("Control color output: auto (default), always, or never"),
+        )
+        .arg(
             Arg::new("timeout")
                 .long("timeout")
                 .global(true)
                 .value_name("SECS")
-                .help("Override the timeout for network-capable operations"),
+                .help("Override the timeout (whole seconds, > 0) for network-capable operations"),
+        )
+        .arg(
+            Arg::new("config")
+                .long("config")
+                .global(true)
+                .value_name("PATH")
+                .help("Load defaults from PATH instead of discovering forge.toml"),
         );
     for plugin in plugins {
         cmd = cmd.subcommand(plugin.command());
@@ -132,8 +191,19 @@ pub fn build_command(plugins: &[Box<dyn ForgePlugin>]) -> Command {
                 Arg::new("shell")
                     .value_name("SHELL")
                     .required(true)
-                    .value_parser(["bash", "zsh", "fish"])
+                    .value_parser(["bash", "zsh", "fish", "powershell"])
                     .help("Shell to generate completions for"),
+            ),
+    );
+    cmd = cmd.subcommand(
+        Command::new("man")
+            .about("Generate man pages for soroban-forge and its subcommands")
+            .arg(
+                Arg::new("out-dir")
+                    .long("out-dir")
+                    .value_name("DIR")
+                    .default_value(".")
+                    .help("Directory to write man pages into (default: current directory)"),
             ),
     );
     cmd
@@ -146,6 +216,10 @@ pub fn dispatch(plugins: &[Box<dyn ForgePlugin>], matches: &ArgMatches) -> Resul
     let json = matches.get_flag("json") || env_flag("SOROBAN_FORGE_JSON");
     let yes = matches.get_flag("yes") || env_flag("SOROBAN_FORGE_YES");
     let offline = matches.get_flag("offline") || env_flag("SOROBAN_FORGE_OFFLINE");
+    let timeout_secs = matches
+        .get_one::<String>("timeout")
+        .map(|value| parse_timeout_secs(value))
+        .transpose()?;
     let (name, sub_matches) = matches
         .subcommand()
         .ok_or_else(|| ForgeError::InvalidArgument("a subcommand is required".into()))?;
@@ -175,9 +249,8 @@ pub fn dispatch(plugins: &[Box<dyn ForgePlugin>], matches: &ArgMatches) -> Resul
             yes,
             offline,
             matches.get_one::<String>("log-level").cloned(),
-            matches
-                .get_one::<String>("timeout")
-                .and_then(|value| value.parse::<u64>().ok()),
+            timeout_secs,
+            matches.get_one::<String>("config").map(std::path::PathBuf::from),
         )?;
         ctx.progress(&format!("running {name}"));
         log::debug!("dispatching to plugin `{}`", plugin.name());
@@ -198,7 +271,7 @@ pub fn dispatch(plugins: &[Box<dyn ForgePlugin>], matches: &ArgMatches) -> Resul
     if let Some(suggestion) = closest_match(name, &plugin_names, 3) {
         eprintln!("unknown subcommand `{name}`. Did you mean `{suggestion}`?");
     }
-    try_run_external(name, sub_matches)
+    try_run_external(name, sub_matches, &external_forward_env(verbose, quiet, json, yes))
 }
 
 /// Entry point used by the `soroban-forge` binary: parse `std::env::args`,
@@ -211,12 +284,18 @@ pub fn run(plugins: Vec<Box<dyn ForgePlugin>>) -> Result<()> {
     // --list must be handled before logging / dispatch so it works even
     // when there is no subcommand.
     if matches.get_flag("list") {
-        list_subcommands(&plugins);
+        list_subcommands(&plugins, matches.get_flag("json"));
         return Ok(());
     }
 
-    let log_file = matches.get_one::<String>("log-file").map(std::path::Path::new);
-    crate::logging::init(matches.get_count("verbose"), log_file)?;
+    // Resolve color preference: --color flag wins; NO_COLOR env var disables
+    // color when the flag is left at its default ("auto").
+    let color_when = matches
+        .get_one::<String>("color")
+        .map(String::as_str)
+        .unwrap_or("auto");
+    let use_color = resolve_color(color_when);
+    crate::logging::init_with_color(matches.get_count("verbose"), matches.get_one::<String>("log-file").map(std::path::Path::new), use_color)?;
 
     let is_json = matches.get_flag("json");
     let result = dispatch(&plugins, &matches);
@@ -233,13 +312,63 @@ pub fn run(plugins: Vec<Box<dyn ForgePlugin>>) -> Result<()> {
     result
 }
 
+/// Determine whether color should be used given `--color WHEN` and the
+/// `NO_COLOR` environment variable.
+///
+/// - `"never"` → always disable
+/// - `"always"` → always enable (even if `NO_COLOR` is set)
+/// - `"auto"` (default) → disable when `NO_COLOR` is set to any non-empty
+///   value, otherwise leave it to `env_logger`'s own auto-detection
+pub fn resolve_color(when: &str) -> bool {
+    match when {
+        "never" => false,
+        "always" => true,
+        _ => {
+            // "auto": honour NO_COLOR (https://no-color.org/)
+            match std::env::var("NO_COLOR") {
+                Ok(v) if !v.is_empty() => false,
+                _ => true, // let env_logger do its own tty detection
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // External subcommand helpers
 // ---------------------------------------------------------------------------
 
+/// Environment variables that carry the global flags consumed before an
+/// external subcommand name, using the `SOROBAN_FORGE_*` convention.
+fn external_forward_env(
+    verbose: u8,
+    quiet: bool,
+    json: bool,
+    yes: bool,
+) -> Vec<(&'static str, &'static str)> {
+    let mut env = Vec::new();
+    if verbose > 0 {
+        env.push(("SOROBAN_FORGE_VERBOSE", "1"));
+    }
+    if quiet {
+        env.push(("SOROBAN_FORGE_QUIET", "1"));
+    }
+    if json {
+        env.push(("SOROBAN_FORGE_JSON", "1"));
+    }
+    if yes {
+        env.push(("SOROBAN_FORGE_YES", "1"));
+    }
+    env
+}
+
 /// Look up `soroban-forge-{name}` on PATH and exec it with the remaining
-/// arguments.  The child inherits our stdio and its exit code becomes ours.
-fn try_run_external(name: &str, sub_matches: &ArgMatches) -> Result<()> {
+/// arguments and the forwarded global-flag environment.  The child inherits
+/// our stdio and its exit code becomes ours.
+fn try_run_external(
+    name: &str,
+    sub_matches: &ArgMatches,
+    forward_env: &[(&str, &str)],
+) -> Result<()> {
     let bin = format!("soroban-forge-{name}");
 
     let ext_args: Vec<&OsStr> = sub_matches
@@ -250,6 +379,7 @@ fn try_run_external(name: &str, sub_matches: &ArgMatches) -> Result<()> {
 
     let mut cmd = std::process::Command::new(&bin);
     cmd.args(&ext_args);
+    cmd.envs(forward_env.iter().copied());
     cmd.stdin(std::process::Stdio::inherit());
     cmd.stdout(std::process::Stdio::inherit());
     cmd.stderr(std::process::Stdio::inherit());
@@ -271,18 +401,27 @@ fn try_run_external(name: &str, sub_matches: &ArgMatches) -> Result<()> {
 }
 
 /// Print all subcommands (built-in + external) to stdout.
-fn list_subcommands(plugins: &[Box<dyn ForgePlugin>]) {
-    println!("Installed subcommands:");
-    println!();
-
+fn list_subcommands(plugins: &[Box<dyn ForgePlugin>], json: bool) {
     let mut builtins: Vec<&str> = plugins.iter().map(|p| p.name()).collect();
     builtins.sort();
+    let externals = find_external_subcommands();
+
+    if json {
+        let output = serde_json::json!({
+            "builtin": builtins,
+            "external": externals,
+        });
+        println!("{}", serde_json::to_string(&output).unwrap());
+        return;
+    }
+
+    println!("Installed subcommands:");
+    println!();
     println!("  Built-in:");
     for name in &builtins {
         println!("    {name}");
     }
 
-    let externals = find_external_subcommands();
     if !externals.is_empty() {
         println!("  External:");
         for name in &externals {
@@ -294,20 +433,29 @@ fn list_subcommands(plugins: &[Box<dyn ForgePlugin>]) {
 /// Scan `PATH` for `soroban-forge-*` binaries and return their subcommand
 /// names (the part after the prefix), deduplicated and sorted.
 fn find_external_subcommands() -> Vec<String> {
+    match std::env::var_os("PATH") {
+        Some(path_var) => find_external_subcommands_in(&path_var),
+        None => Vec::new(),
+    }
+}
+
+/// [`find_external_subcommands`] over an explicit `PATH`-style value.
+fn find_external_subcommands_in(path_var: &OsStr) -> Vec<String> {
     let prefix = "soroban-forge-";
     let mut seen = Vec::new();
 
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name();
-                    let s = name.to_string_lossy();
-                    if let Some(stripped) = s.strip_prefix(prefix) {
-                        let sub = stripped.to_string();
-                        if !seen.contains(&sub) {
-                            seen.push(sub);
-                        }
+    for dir in std::env::split_paths(path_var) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let s = name.to_string_lossy();
+                if let Some(stripped) = s.strip_prefix(prefix) {
+                    if !is_executable(&entry.path()) {
+                        continue;
+                    }
+                    let sub = stripped.to_string();
+                    if !seen.contains(&sub) {
+                        seen.push(sub);
                     }
                 }
             }
@@ -316,6 +464,20 @@ fn find_external_subcommands() -> Vec<String> {
 
     seen.sort();
     seen
+}
+
+/// Whether `path` is a regular file with an executable permission bit set.
+#[cfg(unix)]
+fn is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(_path: &std::path::Path) -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -387,7 +549,14 @@ mod tests {
     fn version_is_workspace_version() {
         let (plugins, _) = dummy();
         let cmd = build_command(&plugins);
-        assert_eq!(cmd.get_version(), Some(env!("CARGO_PKG_VERSION")));
+        // The version string starts with the package version and includes
+        // extra metadata (commit hash, sdk version).
+        let ver = cmd.get_version().unwrap_or("");
+        assert!(
+            ver.starts_with(env!("CARGO_PKG_VERSION")),
+            "version should start with pkg version, got: {ver}"
+        );
+        assert!(ver.contains("soroban-sdk"), "version should contain sdk version, got: {ver}");
     }
 
     #[test]
@@ -468,11 +637,127 @@ mod tests {
     }
 
     #[test]
+    fn timeout_zero_is_rejected_at_dispatch() {
+        let (plugins, ran) = dummy();
+        let matches = build_command(&plugins)
+            .try_get_matches_from(["soroban-forge", "--timeout", "0", "dummy", "--flag"])
+            .unwrap();
+        let err = dispatch(&plugins, &matches).unwrap_err().to_string();
+        assert!(err.contains("--timeout"), "{err}");
+        assert!(!ran.load(Ordering::SeqCst), "plugin must not run with an invalid timeout");
+    }
+
+    #[test]
+    fn timeout_non_numeric_is_rejected_at_dispatch() {
+        let (plugins, _) = dummy();
+        let matches = build_command(&plugins)
+            .try_get_matches_from(["soroban-forge", "--timeout", "soon", "dummy", "--flag"])
+            .unwrap();
+        let err = dispatch(&plugins, &matches).unwrap_err().to_string();
+        assert!(err.contains("--timeout") && err.contains("soon"), "{err}");
+    }
+
+    #[test]
+    fn valid_timeout_is_accepted_at_dispatch() {
+        let (plugins, ran) = dummy();
+        let matches = build_command(&plugins)
+            .try_get_matches_from(["soroban-forge", "--timeout", "5", "dummy", "--flag"])
+            .unwrap();
+        dispatch(&plugins, &matches).unwrap();
+        assert!(ran.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn help_lists_powershell_completions() {
+        let (plugins, _) = dummy();
+        let mut cmd = build_command(&plugins);
+        let help = cmd
+            .find_subcommand_mut("completions")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("powershell"), "{help}");
+        let parsed = build_command(&plugins)
+            .try_get_matches_from(["soroban-forge", "completions", "powershell"]);
+        assert!(parsed.is_ok());
+    }
+
+    #[test]
+    fn external_forward_env_maps_global_flags() {
+        assert!(external_forward_env(0, false, false, false).is_empty());
+        assert_eq!(
+            external_forward_env(2, true, true, true),
+            vec![
+                ("SOROBAN_FORGE_VERBOSE", "1"),
+                ("SOROBAN_FORGE_QUIET", "1"),
+                ("SOROBAN_FORGE_JSON", "1"),
+                ("SOROBAN_FORGE_YES", "1"),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_subcommands_exclude_non_executable_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let make = |name: &str, mode: u32| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        make("soroban-forge-runnable", 0o755);
+        make("soroban-forge-notes.txt.bak", 0o644);
+
+        let found = find_external_subcommands_in(dir.path().as_os_str());
+        assert_eq!(found, vec!["runnable".to_string()]);
+    }
+
+    #[test]
     fn json_is_global_flag() {
         let (plugins, _) = dummy();
         let matches = build_command(&plugins)
             .try_get_matches_from(["soroban-forge", "--json", "dummy", "--flag"])
             .unwrap();
         assert!(matches.get_flag("json"));
+    }
+
+    #[test]
+    fn env_flag_warns_on_unrecognized_value() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        std::env::set_var("TEST_FLAG_UNRECOGNIZED", "on");
+        assert!(!env_flag("TEST_FLAG_UNRECOGNIZED"));
+        std::env::remove_var("TEST_FLAG_UNRECOGNIZED");
+
+        std::env::set_var("TEST_FLAG_YES", "yes");
+        assert!(env_flag("TEST_FLAG_YES"));
+        std::env::remove_var("TEST_FLAG_YES");
+
+        std::env::set_var("TEST_FLAG_FALSE", "false");
+        assert!(!env_flag("TEST_FLAG_FALSE"));
+        std::env::remove_var("TEST_FLAG_FALSE");
+    }
+
+    /// The optimize subcommand must advertise `--in-place` and accept it.
+    /// We use a real `OptimizePlugin` here because core cannot otherwise
+    /// reference it — this exercises the same core-side injection the
+    /// binary relies on.
+    #[test]
+    fn optimize_subcommand_exposes_in_place_flag() {
+        use soroban_forge_optimize::OptimizePlugin;
+
+        let plugins: Vec<Box<dyn ForgePlugin>> = vec![Box::new(OptimizePlugin)];
+        let cmd = build_command(&plugins);
+
+        let help = cmd.clone().render_long_help().to_string();
+        assert!(help.contains("--in-place"), "{help}");
+
+        let matches = cmd
+            .try_get_matches_from(["soroban-forge", "optimize", "--in-place"])
+            .unwrap();
+        let (name, sub) = matches.subcommand().unwrap();
+        assert_eq!(name, "optimize");
+        assert!(sub.get_flag("in-place"));
     }
 }
