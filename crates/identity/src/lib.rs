@@ -51,15 +51,16 @@ pub fn load_store(path: &PathBuf) -> Result<IdentityStore> {
 }
 
 /// Save the identity store to disk, creating parent directories as needed.
+///
+/// Writes through [`soroban_forge_core::atomic::write_atomic`] (#470): a crash
+/// or disk-full error partway through must not leave `identities.json`
+/// truncated, because the next `load_store` would then fail to parse and every
+/// stored identity would be lost.
 pub fn save_store(path: &PathBuf, store: &IdentityStore) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(ForgeError::io(format!("creating {}", parent.display())))?;
-    }
     let json = serde_json::to_string_pretty(store)
         .map_err(|e| ForgeError::Other(format!("serializing identity store: {e}")))?;
-    std::fs::write(path, json)
-        .map_err(ForgeError::io(format!("writing {}", path.display())))
+    soroban_forge_core::atomic::write_atomic(path, &json)
+        .map_err(|e| ForgeError::Other(format!("writing {}: {e}", path.display())))
 }
 
 /// Generate a new Stellar keypair and return `(public_key, secret_key)` as
@@ -512,6 +513,97 @@ mod tests {
             "request was not bounded by the timeout: {:?}",
             started.elapsed()
         );
+    }
+
+    // #470 — a crash mid-write must not corrupt the identity store
+    #[test]
+    fn save_store_replaces_the_file_atomically() {
+        let dir = std::env::temp_dir().join(format!("sf-identity-470-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("identities.json");
+
+        // Write a store with one identity, then a larger one, then a smaller
+        // one. A truncate-and-write would risk a reader seeing a prefix of the
+        // new content; an atomic rename cannot.
+        let mut store = IdentityStore::default();
+        store.identities.insert(
+            "alice".into(),
+            Identity { public_key: "GALICE".into(), secret_key: "SALICE".into() },
+        );
+        save_store(&path, &store).unwrap();
+        let first = std::fs::read_to_string(&path).unwrap();
+
+        store.identities.insert(
+            "bob".into(),
+            Identity { public_key: "GBOB".into(), secret_key: "SBOB".into() },
+        );
+        save_store(&path, &store).unwrap();
+
+        store.identities.remove("alice");
+        save_store(&path, &store).unwrap();
+
+        // Whatever the write sequence, the file always parses and holds exactly
+        // what was last written.
+        let loaded = load_store(&path).unwrap();
+        assert_eq!(loaded.identities.len(), 1);
+        assert!(loaded.identities.contains_key("bob"));
+        assert_ne!(std::fs::read_to_string(&path).unwrap(), first);
+
+        // No temporary file left behind for the next run to trip over.
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["identities.json".to_string()], "stray files: {names:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_save_leaves_the_previous_store_readable() {
+        // The property the issue is really about: whatever goes wrong, the
+        // previously saved identities are still there afterwards.
+        let dir = std::env::temp_dir().join(format!("sf-identity-470b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join("identities.json");
+        let mut store = IdentityStore::default();
+        store.identities.insert(
+            "alice".into(),
+            Identity { public_key: "GALICE".into(), secret_key: "SALICE".into() },
+        );
+        save_store(&path, &store).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // Make the destination directory read-only so the temporary file cannot
+        // be created; the rename therefore never happens.
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        let readonly = perms.clone();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        let mut updated = store.clone();
+        updated.identities.insert(
+            "bob".into(),
+            Identity { public_key: "GBOB".into(), secret_key: "SBOB".into() },
+        );
+        let result = save_store(&path, &updated);
+
+        // Restore permissions before asserting, so the temp dir can be removed.
+        std::fs::set_permissions(&dir, readonly).unwrap();
+
+        if result.is_err() {
+            // The write was refused, and the store on disk is untouched.
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+            assert_eq!(load_store(&path).unwrap().identities.len(), 1);
+        }
+        // On a platform where a read-only directory is not enforced (or when
+        // running as root), the write simply succeeded — the store still parses.
+        assert!(load_store(&path).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // #287 — fund refuses on mainnet passphrase
