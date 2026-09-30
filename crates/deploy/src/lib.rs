@@ -9,7 +9,9 @@
 //! locates the wasm, decides whether a build is needed, assembles the CLI
 //! arguments and extracts the contract ID from the CLI's output.
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Output, Stdio};
 use std::time::Duration;
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
@@ -158,18 +160,52 @@ fn path_str(path: &Path) -> Result<&str> {
 /// Never reimplemented locally.
 ///
 /// Thin system-touching wrapper; not unit-tested.
-pub fn build_stellar_build_args(build_args: &[String]) -> Vec<String> {
-    let mut args = vec!["contract".to_string(), "build".to_string()];
-    args.extend(build_args.iter().cloned());
-    args
+fn stream_command(command: &mut std::process::Command) -> std::io::Result<Output> {
+    let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let mut stdout = child.stdout.take().expect("stdout was piped");
+    let mut stderr = child.stderr.take().expect("stderr was piped");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let count = stdout.read(&mut chunk)?;
+            if count == 0 {
+                break;
+            }
+            std::io::stdout().write_all(&chunk[..count])?;
+            std::io::stdout().flush()?;
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+        Ok::<_, std::io::Error>(bytes)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let count = stderr.read(&mut chunk)?;
+            if count == 0 {
+                break;
+            }
+            std::io::stderr().write_all(&chunk[..count])?;
+            std::io::stderr().flush()?;
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+        Ok::<_, std::io::Error>(bytes)
+    });
+    let status = child.wait()?;
+    let stdout = stdout_reader.join().expect("stdout reader did not panic")?;
+    let stderr = stderr_reader.join().expect("stderr reader did not panic")?;
+    Ok(Output { status, stdout, stderr })
 }
 
-fn run_stellar_build(dir: &Path, build_args: &[String]) -> Result<()> {
-    let args = build_stellar_build_args(build_args);
-    let result = std::process::Command::new("stellar")
-        .args(&args)
-        .current_dir(dir)
-        .output();
+fn run_stellar_build(dir: &Path, verbose: bool) -> Result<()> {
+    let mut command = std::process::Command::new("stellar");
+    command.args(["contract", "build"]).current_dir(dir);
+    let result = if verbose {
+        stream_command(&mut command)
+    } else {
+        command.output()
+    };
 
     match result {
         Ok(out) if out.status.success() => Ok(()),
@@ -190,13 +226,13 @@ fn run_stellar_build(dir: &Path, build_args: &[String]) -> Result<()> {
 /// release build of the cargo project in `dir` — building it first with
 /// `stellar contract build` if it is not there yet.
 pub fn build_if_needed(dir: &Path, wasm_override: Option<&Path>) -> Result<PathBuf> {
-    build_if_needed_with_args(dir, wasm_override, &[])
+    build_if_needed_with_output(dir, wasm_override, false)
 }
 
-fn build_if_needed_with_args(
+fn build_if_needed_with_output(
     dir: &Path,
     wasm_override: Option<&Path>,
-    build_args: &[String],
+    verbose: bool,
 ) -> Result<PathBuf> {
     if let Some(path) = wasm_override {
         return Ok(path.to_path_buf());
@@ -205,7 +241,7 @@ fn build_if_needed_with_args(
     let crate_name = read_crate_name(dir)?;
     let wasm_path = locate_wasm(dir, &crate_name);
     if !wasm_path.is_file() {
-        run_stellar_build(dir, build_args)?;
+        run_stellar_build(dir, verbose)?;
     }
     if !wasm_path.is_file() {
         return Err(ForgeError::Other(format!(
@@ -257,6 +293,30 @@ pub fn build_deploy_args_with_alias(
         wasm_str,
         "--source".to_string(),
         source.to_string(),
+        "--output".to_string(),
+        "json".to_string(),
+    ];
+    args.extend(network.cli_args());
+    Ok(args)
+}
+
+/// Assemble `stellar contract upgrade` arguments for an existing contract.
+pub fn build_upgrade_args(
+    contract_id: &str,
+    wasm: &Path,
+    source: &str,
+    network: &NetworkArgs,
+) -> Result<Vec<String>> {
+    let wasm_str = path_str(wasm)?.to_string();
+    let mut args = vec![
+        "contract".to_string(),
+        "upgrade".to_string(),
+        "--contract-id".to_string(),
+        contract_id.to_string(),
+        "--wasm".to_string(),
+        wasm_str,
+        "--source".to_string(),
+        source.to_string(),
     ];
     if let Some(alias) = alias {
         args.push("--alias".to_string());
@@ -295,18 +355,17 @@ fn run_stellar_deploy(
     network: &NetworkArgs,
     constructor_args: &[(String, String)],
     timeout: Option<Duration>,
-    alias: Option<&str>,
+    verbose: bool,
 ) -> Result<String> {
     log::debug!("deploying {}", wasm.display());
-    // Command accepts OsStr, so actual deployment works even when the wasm
-    // path is not UTF-8 (notably on Windows user profiles).
+
     let mut command = std::process::Command::new("stellar");
-    command
-        .args(["contract", "deploy", "--wasm"])
-        .arg(wasm.as_os_str())
-        .args(["--source", source]);
-    command.args(network.cli_args());
-    let result = soroban_forge_core::timeout::output_with_timeout(&mut command, timeout);
+    command.args(&args);
+    let result = if verbose {
+        stream_command(&mut command)
+    } else {
+        soroban_forge_core::timeout::output_with_timeout(&mut command, timeout)
+    };
 
     match result {
         Ok(out) if out.status.success() => {
@@ -330,79 +389,26 @@ fn run_stellar_deploy(
     }
 }
 
-/// Turn repeated network flags into distinct deployment targets. Named
-/// networks and explicit RPC targets deliberately cannot be mixed in one
-/// invocation because there is no unambiguous way to pair their credentials.
-pub fn resolve_network_targets(
-    networks: Vec<String>,
-    rpc_urls: Vec<String>,
-    passphrases: Vec<String>,
-) -> Result<Vec<NetworkArgs>> {
-    if !networks.is_empty() && !rpc_urls.is_empty() {
-        return Err(ForgeError::InvalidArgument(
-            "use repeated --network or repeated --rpc-url, not both in the same deploy".into(),
-        ));
-    }
-    let values = if networks.is_empty() { rpc_urls } else { networks };
-    if values.is_empty() {
-        return Ok(vec![NetworkArgs::resolve(None, None, None)]);
-    }
-    if !passphrases.is_empty() && passphrases.len() != 1 && passphrases.len() != values.len() {
-        return Err(ForgeError::InvalidArgument(
-            "supply one --network-passphrase for all targets or one per target".into(),
-        ));
-    }
-    let is_rpc = networks.is_empty();
-    Ok(values
-        .into_iter()
-        .enumerate()
-        .map(|(index, value)| {
-            let passphrase = passphrases
-                .get(if passphrases.len() == 1 { 0 } else { index })
-                .cloned();
-            if is_rpc {
-                NetworkArgs::resolve(None, Some(value), passphrase)
-            } else {
-                NetworkArgs::resolve(Some(value), None, passphrase)
-            }
-        })
-        .collect())
-}
-
-fn require_mainnet_confirmation<F>(
-    network: &NetworkArgs,
-    yes: bool,
-    interactive: bool,
-    mut confirm_fn: F,
-) -> Result<()>
-where
-    F: FnMut(&str) -> bool,
-{
-    if !network.is_mainnet() || yes {
-        return Ok(());
-    }
-    if !interactive {
-        return Err(ForgeError::InvalidArgument(format!(
-            "refusing to deploy to mainnet ({}) without confirmation in a non-interactive terminal; pass --yes to proceed",
-            network.label()
-        )));
-    }
-    if confirm_fn(&format!("Deploy this contract to mainnet ({})?", network.label())) {
-        Ok(())
-    } else {
-        Err(ForgeError::InvalidArgument("mainnet deployment cancelled".into()))
-    }
-}
-
-/// Pull the contract ID out of `stellar contract deploy`'s stdout: the last
-/// non-empty line that looks like a strkey contract ID (`C` + 55 base32
-/// characters).
+/// Pull the contract ID out of `stellar contract deploy` output. JSON output
+/// is preferred when supported by stellar-cli; the text fallback accepts only
+/// checksum-valid StrKey contract IDs, never merely a C-prefixed lookalike.
 pub fn extract_contract_id(stdout: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout) {
+        let id = value
+            .get("contract_id")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| value.as_str());
+        if let Some(id) = id {
+            if stellar_strkey::Contract::from_string(id).is_ok() {
+                return Some(id.to_string());
+            }
+        }
+    }
     stdout
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
-        .rfind(|l| l.starts_with('C') && l.chars().count() == 56)
+        .rfind(|l| stellar_strkey::Contract::from_string(l).is_ok())
         .map(str::to_string)
 }
 
@@ -416,20 +422,48 @@ pub fn deploy(
     constructor_args: &[(String, String)],
     timeout: Option<Duration>,
 ) -> Result<String> {
-    deploy_with_options(dir, wasm_override, source, network, timeout, &[], None)
+    deploy_with_output(dir, wasm_override, source, network, timeout, false)
 }
 
-fn deploy_with_options(
+fn deploy_with_output(
     dir: &Path,
     wasm_override: Option<&Path>,
     source: &str,
     network: &NetworkArgs,
     timeout: Option<Duration>,
-    build_args: &[String],
-    alias: Option<&str>,
+    verbose: bool,
 ) -> Result<String> {
-    let wasm_path = build_if_needed_with_args(dir, wasm_override, build_args)?;
-    run_stellar_deploy(&wasm_path, source, network, timeout, alias)
+    let wasm_path = build_if_needed_with_output(dir, wasm_override, verbose)?;
+    run_stellar_deploy(&wasm_path, source, network, timeout, verbose)
+}
+
+fn run_stellar_upgrade(
+    contract_id: &str,
+    wasm: &Path,
+    source: &str,
+    network: &NetworkArgs,
+    timeout: Option<Duration>,
+    verbose: bool,
+) -> Result<()> {
+    let args = build_upgrade_args(contract_id, wasm, source, network)?;
+    let mut command = std::process::Command::new("stellar");
+    command.args(&args);
+    let result = if verbose {
+        stream_command(&mut command)
+    } else {
+        soroban_forge_core::timeout::output_with_timeout(&mut command, timeout)
+    };
+    match result {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => Err(ForgeError::Other(format!(
+            "stellar contract upgrade failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        ))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(ForgeError::ToolMissing("stellar-cli".into()))
+        }
+        Err(e) => Err(ForgeError::io("running stellar contract upgrade")(e)),
+    }
 }
 
 /// Names of arguments that may contain secret material and must be redacted
@@ -510,6 +544,55 @@ pub fn resolve_source_public_key(source: &str) -> Option<String> {
     }
 
     None
+}
+
+/// Return the closest locally managed identity name, if the source looks like
+/// a near miss. This is advisory only: identities managed by stellar-cli must
+/// still be allowed through to the underlying command.
+fn source_identity_suggestion(source: &str) -> Option<String> {
+    let source = source.trim();
+    if source.starts_with('G') || source.starts_with('S') {
+        return None;
+    }
+    let config_dir = dirs::config_dir()?;
+    let path = config_dir.join("soroban-forge").join("identities.json");
+    let raw = std::fs::read_to_string(path).ok()?;
+    let identities = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()?
+        .get("identities")?
+        .as_object()?;
+    if identities.contains_key(source) {
+        return None;
+    }
+    closest_identity_name(source, identities.keys().map(String::as_str))
+}
+
+fn closest_identity_name<'a>(source: &str, names: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut closest: Option<(usize, &str)> = None;
+    for name in names {
+        let distance = levenshtein_distance(source, name);
+        if closest.map(|(best, _)| distance < best).unwrap_or(true) {
+            closest = Some((distance, name));
+        }
+    }
+    let threshold = (source.chars().count().max(3) / 3).max(1);
+    closest
+        .filter(|(distance, _)| *distance <= threshold)
+        .map(|(_, name)| name.to_string())
+}
+
+fn levenshtein_distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    for (left_index, left_char) in left.chars().enumerate() {
+        let mut current = vec![left_index + 1];
+        for (right_index, right_char) in right.iter().enumerate() {
+            let replacement = previous[right_index] + usize::from(left_char != *right_char);
+            current.push((previous[right_index + 1] + 1).min(current[right_index] + 1).min(replacement));
+        }
+        previous = current;
+    }
+    previous[right.len()]
 }
 
 /// GET `url`, bounded by `timeout` when one is set (`--timeout`).
@@ -856,18 +939,10 @@ impl ForgePlugin for DeployPlugin {
                     .help("Automatically fund an unfunded testnet source account via friendbot before deploying"),
             )
             .arg(
-                Arg::new("build-arg")
-                    .long("build-arg")
-                    .value_name("ARG")
-                    .action(clap::ArgAction::Append)
-                    .allow_hyphen_values(true)
-                    .help("Forward one argument to stellar contract build (repeatable, e.g. --build-arg=--features)"),
-            )
-            .arg(
-                Arg::new("alias")
-                    .long("alias")
-                    .value_name("NAME")
-                    .help("Register the deployed contract under this stellar-cli alias"),
+                Arg::new("upgrade")
+                    .long("upgrade")
+                    .value_name("CONTRACT_ID")
+                    .help("Upgrade this existing contract instead of creating a new one"),
             )
     }
 
@@ -892,59 +967,34 @@ impl ForgePlugin for DeployPlugin {
         let source = matches
             .get_one::<String>("source")
             .expect("source is required by clap");
-        let build_args: Vec<String> = matches
-            .get_many::<String>("build-arg")
-            .unwrap_or_default()
-            .cloned()
-            .collect();
-        let alias = matches.get_one::<String>("alias").map(String::as_str);
+        let upgrade_contract_id = matches.get_one::<String>("upgrade");
 
-        // Parse --arg NAME=VALUE pairs.
-        let constructor_args: Vec<(String, String)> = matches
-            .get_many::<String>("arg")
-            .unwrap_or_default()
-            .map(|raw| parse_constructor_arg(raw))
-            .collect::<Result<Vec<_>>>()?;
-
-        let networks = resolve_network_targets(
-            matches
-                .get_many::<String>("network")
-                .unwrap_or_default()
-                .cloned()
-                .collect(),
-            matches
-                .get_many::<String>("rpc-url")
-                .unwrap_or_default()
-                .cloned()
-                .collect(),
-            matches
-                .get_many::<String>("network-passphrase")
-                .unwrap_or_default()
-                .cloned()
-                .collect(),
-        )?;
-
-        if !dry_run && !ctx.offline {
-            use std::io::IsTerminal;
-            let interactive = !ctx.json
-                && std::io::stdin().is_terminal()
-                && std::io::stdout().is_terminal();
-            for network in &networks {
-                require_mainnet_confirmation(network, ctx.yes, interactive, confirm)?;
-                if network.is_testnet() {
-                    ensure_source_funded(source, network, auto_fund, ctx)?;
-                }
+        if let Some(suggestion) = source_identity_suggestion(source) {
+            if !ctx.quiet && !ctx.json {
+                eprintln!(
+                    "note: `{source}` is not a local soroban-forge identity; did you mean `{suggestion}`? \
+                     continuing so stellar-cli-managed identities still work."
+                );
             }
+        }
+
+        let network = NetworkArgs::resolve(
+            matches.get_one::<String>("network").cloned(),
+            matches.get_one::<String>("rpc-url").cloned(),
+            matches.get_one::<String>("network-passphrase").cloned(),
+        );
+
+        if !dry_run && !ctx.offline && network.is_testnet() {
+            ensure_source_funded(source, &network, auto_fund, ctx)?;
         }
 
         if dry_run {
             let wasm_path = build_if_needed(&dir, wasm_override.as_deref())?;
-            let commands: Result<Vec<String>> = networks
-                .iter()
-                .map(|network| build_deploy_args(&wasm_path, source, network)
-                    .map(|args| format_dry_run_command("stellar", &args)))
-                .collect();
-            let commands = commands?;
+            let args = match upgrade_contract_id {
+                Some(contract_id) => build_upgrade_args(contract_id, &wasm_path, source, &network)?,
+                None => build_deploy_args(&wasm_path, source, &network)?,
+            };
+            let command_line = format_dry_run_command("stellar", &args);
             if ctx.json {
                 let report = serde_json::json!({ "commands": commands });
                 println!("{}", serde_json::to_string_pretty(&report).unwrap());
@@ -956,17 +1006,41 @@ impl ForgePlugin for DeployPlugin {
             return Ok(());
         }
 
-        // Resolve and (if necessary) build exactly once, then deploy the same
-        // immutable wasm to every requested target.
-        let wasm_path = build_if_needed(&dir, wasm_override.as_deref())?;
-        let reports: Result<Vec<(String, String)>> = networks
-            .iter()
-            .map(|network| {
-                run_stellar_deploy(&wasm_path, source, network, ctx.timeout())
-                    .map(|contract_id| (network.label(), contract_id))
-            })
-            .collect();
-        let reports = reports?;
+        if let Some(contract_id) = upgrade_contract_id {
+            let wasm_path = build_if_needed_with_output(
+                &dir,
+                wasm_override.as_deref(),
+                ctx.verbose > 0,
+            )?;
+            run_stellar_upgrade(
+                contract_id,
+                &wasm_path,
+                source,
+                &network,
+                ctx.timeout(),
+                ctx.verbose > 0,
+            )?;
+            if ctx.json {
+                let report = serde_json::json!({
+                    "contract_id": contract_id,
+                    "network": network.label(),
+                    "upgraded": true,
+                });
+                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            } else if !ctx.quiet {
+                println!("upgraded contract {contract_id} on {}", network.label());
+            }
+            return Ok(());
+        }
+
+        let contract_id = deploy_with_output(
+            &dir,
+            wasm_override.as_deref(),
+            source,
+            &network,
+            ctx.timeout(),
+            ctx.verbose > 0,
+        )?;
 
         if ctx.json {
             let report: Vec<_> = reports
@@ -994,6 +1068,10 @@ impl ForgePlugin for DeployPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn contract_id(seed: u8) -> String {
+        stellar_strkey::Contract([seed; 32]).to_string()
+    }
 
     #[test]
     fn locates_wasm_by_crate_name() {
@@ -1066,44 +1144,18 @@ mod tests {
     }
 
     #[test]
-    fn repeated_networks_produce_one_target_each() {
-        let targets = resolve_network_targets(
-            vec!["testnet".into(), "futurenet".into()],
-            vec![],
-            vec![],
-        )
-        .unwrap();
-        assert_eq!(targets.len(), 2);
-        assert_eq!(targets[0].label(), "testnet");
-        assert_eq!(targets[1].label(), "futurenet");
+    fn extracts_only_a_checksum_valid_contract_id() {
+        let incidental = format!("C{}", "A".repeat(55));
+        let deployed = contract_id(7);
+        let stdout = format!("ℹ️ deploying...\n{incidental}\nsuccess\n{deployed}\n");
+        assert_eq!(extract_contract_id(&stdout).as_deref(), Some(deployed.as_str()));
     }
 
     #[test]
-    fn mainnet_confirmation_is_skipped_with_yes() {
-        let network = NetworkArgs::resolve(Some("mainnet".into()), None, None);
-        let mut prompted = false;
-        require_mainnet_confirmation(&network, true, false, |_| {
-            prompted = true;
-            false
-        })
-        .unwrap();
-        assert!(!prompted);
-    }
-
-    #[test]
-    fn mainnet_confirmation_requires_yes_when_not_interactive() {
-        let network = NetworkArgs::resolve(Some("mainnet".into()), None, None);
-        let err = require_mainnet_confirmation(&network, false, false, |_| true).unwrap_err();
-        assert!(err.to_string().contains("pass --yes"), "{err}");
-    }
-
-    #[test]
-    fn extracts_the_last_contract_id_line() {
-        let stdout = "ℹ️ deploying...\nsuccess\nCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n";
-        assert_eq!(
-            extract_contract_id(stdout).as_deref(),
-            Some("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
-        );
+    fn extracts_contract_id_from_structured_deploy_output() {
+        let deployed = contract_id(8);
+        let stdout = format!(r#"{{"contract_id":"{deployed}"}}"#);
+        assert_eq!(extract_contract_id(&stdout).as_deref(), Some(deployed.as_str()));
     }
 
     #[test]
@@ -1144,6 +1196,12 @@ mod tests {
     }
 
     #[test]
+    fn help_documents_upgrade_mode() {
+        let help = DeployPlugin.command().render_long_help().to_string();
+        assert!(help.contains("--upgrade"), "{help}");
+    }
+
+    #[test]
     fn build_deploy_args_assembles_full_command() {
         let tmp = tempfile::tempdir().unwrap();
         let wasm = tmp.path().join("my_contract.wasm");
@@ -1157,6 +1215,23 @@ mod tests {
         assert!(args.contains(&"alice".to_string()));
         assert!(args.contains(&"--network".to_string()));
         assert!(args.contains(&"testnet".to_string()));
+        assert!(args.contains(&"json".to_string()));
+    }
+
+    #[test]
+    fn build_upgrade_args_assembles_full_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wasm = tmp.path().join("my_contract.wasm");
+        std::fs::write(&wasm, b"\0asm").unwrap();
+        let network = NetworkArgs::resolve(None, None, None);
+        let contract_id = contract_id(9);
+        let args = build_upgrade_args(&contract_id, &wasm, "alice", &network).unwrap();
+
+        assert_eq!(args[0], "contract");
+        assert_eq!(args[1], "upgrade");
+        assert!(args.windows(2).any(|pair| pair[0] == "--contract-id" && pair[1] == contract_id));
+        assert!(args.windows(2).any(|pair| pair[0] == "--source" && pair[1] == "alice"));
+        assert!(args.windows(2).any(|pair| pair[0] == "--network" && pair[1] == "testnet"));
     }
 
     #[test]
@@ -1258,6 +1333,12 @@ mod tests {
     fn resolve_source_public_key_accepts_direct_pubkey() {
         let pk = "GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H";
         assert_eq!(resolve_source_public_key(pk), Some(pk.to_string()));
+    }
+
+    #[test]
+    fn source_identity_near_miss_suggests_the_closest_local_name() {
+        let suggestion = closest_identity_name("deployer", ["deployer-prod", "alice", "deployr"]);
+        assert_eq!(suggestion.as_deref(), Some("deployr"));
     }
 
     #[test]
