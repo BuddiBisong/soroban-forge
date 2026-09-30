@@ -108,10 +108,8 @@ pub fn resolve_local_wasm(dir: &Path, wasm_override: Option<&Path>) -> Result<Pa
     Ok(wasm_path)
 }
 
-/// Cheap shape check on a strkey contract ID so an obvious typo fails before
-/// we shell out to the network. Contract IDs are 56 base32 characters
-/// starting with `C`; the checksum is left to the `stellar` CLI, which
-/// decodes the strkey for real.
+/// Validate both the shape and StrKey checksum locally, before any network
+/// call or stellar-cli invocation.
 pub fn validate_contract_id(id: &str) -> Result<()> {
     let invalid = |reason: &str| {
         Err(ForgeError::InvalidArgument(format!(
@@ -130,6 +128,11 @@ pub fn validate_contract_id(id: &str) -> Result<()> {
         .all(|c| c.is_ascii_uppercase() || ('2'..='7').contains(&c))
     {
         return invalid("contains characters outside the base32 alphabet");
+    }
+    if stellar_strkey::Contract::from_string(id).is_err() {
+        return Err(ForgeError::InvalidArgument(format!(
+            "`{id}` is not a valid contract ID (checksum failure)"
+        )));
     }
     Ok(())
 }
@@ -528,6 +531,12 @@ pub fn json_report(report: &VerifyReport) -> String {
     serde_json::to_string_pretty(report).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
 }
 
+/// One concise, human-readable verdict for CI logs.
+pub fn format_summary(report: &VerifyReport) -> String {
+    let verdict = if report.matches { "MATCH" } else { "MISMATCH" };
+    format!("verify: {verdict} on {} — {}", report.network, report.contract_id)
+}
+
 /// The mismatch error returned to the CLI core, which turns it into exit
 /// code `1`.
 pub fn mismatch_error(report: &VerifyReport) -> ForgeError {
@@ -679,6 +688,44 @@ pub fn verify(
     Ok(report.with_spec_diff(diff))
 }
 
+/// Compare the local wasm to a known deployed hash, without fetching from a
+/// network. The hash is still represented as `onchain_hash` in the report so
+/// all existing text and JSON report consumers keep one stable shape.
+pub fn verify_with_wasm_hash(
+    contract_id: &str,
+    contract_dir: &Path,
+    wasm_override: Option<&Path>,
+    network: &NetworkArgs,
+    reproducible: bool,
+    wasm_hash: &str,
+) -> Result<VerifyReport> {
+    validate_contract_id(contract_id)?;
+    let expected_hash = normalize_wasm_hash(wasm_hash)?;
+    let local_wasm = if reproducible {
+        build_reproducible(contract_dir)?
+    } else {
+        resolve_local_wasm(contract_dir, wasm_override)?
+    };
+    let local_hash = hash_wasm_file(&local_wasm)?;
+    Ok(VerifyReport::new(
+        contract_id,
+        network.label(),
+        &local_wasm,
+        local_hash,
+        expected_hash,
+    ))
+}
+
+fn normalize_wasm_hash(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ForgeError::InvalidArgument(
+            "--wasm-hash must be a 64-character SHA-256 hex digest".into(),
+        ));
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
 /// Run the official soroban build inside the pinned image and return the
 /// resulting wasm path. `stellar contract build` runs inside the container
 /// with `contract_dir` mounted at `/src`; the wasm ends up at
@@ -753,9 +800,9 @@ impl ForgePlugin for VerifyPlugin {
             )
             .arg(
                 Arg::new("contract-id")
-                    .required(true)
+                    .required(false)
                     .value_name("CONTRACT_ID")
-                    .help("Deployed contract ID (C…)"),
+                    .help("Deployed contract ID (C…); omit to fall back to the last ID in deployments.json"),
             )
             .arg(
                 Arg::new("path")
@@ -790,6 +837,18 @@ impl ForgePlugin for VerifyPlugin {
                     .action(ArgAction::SetTrue)
                     .help("Build the contract inside the pinned reproducible-build container before hashing"),
             )
+            .arg(
+                Arg::new("wasm-hash")
+                    .long("wasm-hash")
+                    .value_name("SHA256")
+                    .help("Compare the local wasm to this known deployed SHA-256 without fetching"),
+            )
+            .arg(
+                Arg::new("summary")
+                    .long("summary")
+                    .action(ArgAction::SetTrue)
+                    .help("Print a one-line verification summary for CI logs"),
+            )
     }
 
     fn run(&self, matches: &ArgMatches, ctx: &ForgeContext) -> Result<()> {
@@ -797,7 +856,8 @@ impl ForgePlugin for VerifyPlugin {
             .get_one::<String>("contract-id")
             .expect("contract-id is required by clap");
 
-        if ctx.offline {
+        let wasm_hash = matches.get_one::<String>("wasm-hash");
+        if ctx.offline && wasm_hash.is_none() {
             return Err(ForgeError::InvalidArgument(
                 "verify is unavailable in offline mode because it must fetch deployed wasm".into(),
             ));
@@ -816,19 +876,56 @@ impl ForgePlugin for VerifyPlugin {
             ctx.config.as_ref().map(|c| &c.network),
         );
 
+        // Issue #281: fall back to recorded contract ID when none is given.
+        let contract_id: String = match matches.get_one::<String>("contract-id") {
+            Some(id) => id.clone(),
+            None => {
+                let crate_name = read_crate_name(&dir).unwrap_or_default();
+                let net_label = network
+                    .network
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_NETWORK.to_string());
+                soroban_forge_deploy::lookup_recorded_contract_id(&dir, &crate_name, &net_label)
+                    .ok_or_else(|| {
+                        ForgeError::InvalidArgument(
+                            "no contract-id given and no deployment recorded in deployments.json — \
+                             run `soroban-forge deploy` first or pass a contract ID explicitly"
+                                .into(),
+                        )
+                    })?
+            }
+        };
+
         let reproducible = matches.get_flag("reproducible");
-        let report = verify(
-            contract_id,
-            &dir,
-            wasm_override.as_deref(),
-            &network,
-            reproducible,
-            ctx.timeout(),
-        )?;
+        let report = match wasm_hash {
+            Some(wasm_hash) => verify_with_wasm_hash(
+                contract_id,
+                &dir,
+                wasm_override.as_deref(),
+                &network,
+                reproducible,
+                wasm_hash,
+            )?,
+            None => verify(
+                contract_id,
+                &dir,
+                wasm_override.as_deref(),
+                &network,
+                reproducible,
+                ctx.timeout(),
+            )?,
+        };
 
         if ctx.json {
             println!("{}", json_report(&report));
-        } else if !ctx.quiet {
+        }
+        if matches.get_flag("summary") && !ctx.quiet {
+            if ctx.json {
+                eprintln!("{}", format_summary(&report));
+            } else {
+                println!("{}", format_summary(&report));
+            }
+        } else if !ctx.json && !ctx.quiet {
             print!("{}", format_report(&report));
         }
 
@@ -844,8 +941,7 @@ impl ForgePlugin for VerifyPlugin {
 mod tests {
     use super::*;
 
-    /// A syntactically valid contract ID (shape only — no real checksum).
-    const VALID_ID: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const VALID_ID: &str = "CA3D5KRYM6CB7OWQ6TWYRR3Z4T7GNZLKERYNZGGA5SOAOPIFY6YQGAXE";
 
     fn wasm_bytes(payload: &[u8]) -> Vec<u8> {
         let mut bytes = b"\0asm\x01\0\0\0".to_vec();
@@ -920,6 +1016,13 @@ mod tests {
                 soroban_forge_core::error::ExitCode::UserError
             );
         }
+    }
+
+    #[test]
+    fn rejects_a_shape_valid_contract_id_with_an_invalid_checksum() {
+        let err = validate_contract_id("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+            .unwrap_err();
+        assert!(err.to_string().contains("checksum failure"), "{err}");
     }
 
     #[test]
@@ -1067,6 +1170,46 @@ mod tests {
         assert_eq!(parsed["network"], "testnet");
         assert_eq!(parsed["local_hash"], "aa");
         assert_eq!(parsed["onchain_hash"], "bb");
+    }
+
+    #[test]
+    fn known_wasm_hash_reports_match_and_mismatch_without_fetching() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wasm = tmp.path().join("demo.wasm");
+        let bytes = wasm_bytes(b"known hash");
+        std::fs::write(&wasm, &bytes).unwrap();
+        let hash = sha256_hex(&bytes);
+        let network = NetworkArgs::default();
+
+        let matching = verify_with_wasm_hash(
+            VALID_ID,
+            tmp.path(),
+            Some(&wasm),
+            &network,
+            false,
+            &hash,
+        )
+        .unwrap();
+        assert!(matching.matches);
+
+        let mismatching = verify_with_wasm_hash(
+            VALID_ID,
+            tmp.path(),
+            Some(&wasm),
+            &network,
+            false,
+            &"0".repeat(64),
+        )
+        .unwrap();
+        assert!(!mismatching.matches);
+    }
+
+    #[test]
+    fn summaries_are_one_line_for_both_outcomes() {
+        let matched = VerifyReport::new(VALID_ID, "testnet", Path::new("a.wasm"), "aa", "aa");
+        let mismatched = VerifyReport::new(VALID_ID, "testnet", Path::new("a.wasm"), "aa", "bb");
+        assert_eq!(format_summary(&matched), format!("verify: MATCH on testnet — {VALID_ID}"));
+        assert_eq!(format_summary(&mismatched), format!("verify: MISMATCH on testnet — {VALID_ID}"));
     }
 
     #[test]
