@@ -37,6 +37,7 @@ soroban-forge-init = { path = "crates/init" }
 soroban-forge-deploy = { path = "crates/deploy" }
 soroban-forge-invoke = { path = "crates/invoke" }
 clap_complete.workspace = true
+clap_mangen.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -60,6 +61,7 @@ soroban-forge-scaffold = { path = "crates/scaffold" }
 soroban-forge-deploy = { path = "crates/deploy" }
 clap = "4.5"
 clap_complete = "4.5"
+clap_mangen = "0.2"
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
