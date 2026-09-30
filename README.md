@@ -18,9 +18,19 @@
 
 [![asciinema cast](https://asciinema.org/a/soroban-forge-zero-to-testnet.svg)](https://asciinema.org/a/soroban-forge-zero-to-testnet)
 
-You need Rust ≥ 1.84 ([rustup](https://rustup.rs)) and `git`. The two remaining
-pieces — the `wasm32v1-none` target and `stellar-cli` — are what `doctor --fix`
-installs in step 2.
+### Install soroban-forge
+
+**Homebrew** (macOS / Linux — no Rust required):
+
+```sh
+brew tap soroban-forge-labs/tap
+brew install soroban-forge
+```
+
+> Full Homebrew docs, including upgrade, uninstall, and shell completions:
+> [docs/install-homebrew.md](docs/install-homebrew.md)
+
+**From source** (requires Rust ≥ 1.84):
 
 ```sh
 # 1. install soroban-forge (from source, v0.1)
@@ -31,7 +41,8 @@ cd soroban-forge && cargo install --path . && cd ..
 #    (--fix prompts before running each install; drop it to only report)
 soroban-forge doctor --fix
 
-# 3. create a project (`soroban-forge templates` lists all six)
+# 3. create a project (`soroban-forge templates` lists all of them —
+#    see docs/template-catalogue.md for what each demonstrates)
 soroban-forge new my-token --template token
 cd my-token
 
@@ -53,6 +64,12 @@ New to Soroban entirely? Follow the full walkthrough:
 Hitting an error? Check the
 [troubleshooting / FAQ](docs/troubleshooting.md) page first.
 
+Other useful starting points:
+
+- [Template catalogue](docs/template-catalogue.md) — every bundled template, what it demonstrates, and when to pick it
+- [CLI cookbook](docs/cookbook.md) — copy-paste recipes for common workflows
+- [Security considerations](docs/security-considerations.md) — what the generated contracts do and do not protect against
+
 ## Commands
 
 | command                          | what it does                                              |
@@ -63,7 +80,8 @@ Hitting an error? Check the
 | `test-init`                      | generate fixtures + smoke/TTL tests; `--layout inline` puts them in `src/` |
 | `ci-init --provider github`      | write CI workflows (`github`, `gitlab`, `circleci`, `bitbucket`); `--deploy` adds manual testnet deploy, `--matrix` a toolchain matrix |
 | `doctor`                         | check rustc/cargo, `wasm32v1-none` target, stellar-cli    |
-| `bindings ts`                    | generate a TypeScript client package from a built contract wasm |
+| `bindings ts [--react]`          | generate a TypeScript client package from a built contract wasm; `--react` adds typed hooks |
+| `bindings-py`                    | generate a typed Python client (`client.py`) from a built contract wasm |
 | `spec`                           | print the contract interface — entrypoints with their argument and return types — from the built wasm (`--json` for machine-readable output) |
 | `verify <contract-id>`           | compare a deployed contract's wasm hash with the local release build (exit `1` on mismatch) |
 | `deploy --source <identity>`     | build (if needed) and deploy the contract, printing its contract ID |
@@ -95,13 +113,18 @@ with its own README, tests and a small public surface; they meet only at the
 | 6 — TypeScript bindings | [`crates/bindings-ts`](crates/bindings-ts) | `bindings ts` |
 | 7 — Deployment verification | [`crates/verify`](crates/verify) | `verify` |
 | 8 — Contract interface dump | [`crates/spec`](crates/spec) | `spec` |
+| 9 — Python bindings | [`crates/binding-py`](crates/binding-py) | `bindings-py` |
 
 > **Note:** See [`examples/README.md`](examples/README.md) for instructions on
 > regenerating the checked-in example projects.
 
+The full docs are also published as a browsable site:
+[soroban-forge-labs.github.io/soroban-forge](https://soroban-forge-labs.github.io/soroban-forge/).
+
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the ownership map and how to pick
-up an issue — [ISSUES.md](ISSUES.md) lists well-scoped starter work.
+up an issue — [ISSUES.md](ISSUES.md) lists well-scoped starter work. All
+contributors are expected to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Requirements
 

@@ -1,0 +1,22 @@
+[package]
+name = "soroban-forge-hello"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# A real, out-of-tree plugin would depend on a published version instead:
+#   soroban-forge-core = "0.1"
+# The path dependency exists only so this example compiles inside the
+# soroban-forge repo itself (see docs/plugin-tutorial.md).
+[dependencies]
+soroban-forge-core = { path = "../../../crates/core" }
+clap = "4.5"
+
+[[bin]]
+name = "soroban-forge-hello"
+path = "src/main.rs"
+
+# Keep this example crate out of soroban-forge's own workspace — it's a
+# separate, standalone project as far as Cargo is concerned, exactly like a
+# real third-party plugin's own repo would be.
+[workspace]
