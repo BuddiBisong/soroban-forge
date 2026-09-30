@@ -1128,6 +1128,7 @@ dependencies = [
  "serde",
  "serde_json",
  "soroban-forge-core",
+ "soroban-forge-network",
  "soroban-forge-scaffold",
  "tempfile",
  "toml",
