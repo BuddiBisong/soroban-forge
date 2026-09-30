@@ -57,6 +57,7 @@ rust-version = "1.84"
 
 [workspace.dependencies]
 soroban-forge-core = { path = "crates/core" }
+soroban-forge-network = { path = "crates/network" }
 soroban-forge-scaffold = { path = "crates/scaffold" }
 soroban-forge-deploy = { path = "crates/deploy" }
 clap = "4.5"

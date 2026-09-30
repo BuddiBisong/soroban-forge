@@ -1016,11 +1016,13 @@ fn config_network_url(config: Option<&soroban_forge_core::config::ForgeConfig>) 
         return Some(url.to_owned());
     }
     let name = config.network.name.as_deref()?;
-    match name {
-        "testnet" => Some(TESTNET_RPC_URL.to_string()),
-        "futurenet" => Some("https://rpc-futurenet.stellar.org".to_string()),
-        "localnet" => Some("http://localhost:8000/soroban/rpc".to_string()),
-        _ => Some(name.to_string()),
+    // Resolve well-known names through the network crate so doctor's mapping
+    // cannot drift from the RPC URLs the rest of the toolchain uses (#485).
+    // Unknown names still fall through to the literal string, which is the
+    // only thing available for a custom network with no explicit rpc_url.
+    match soroban_forge_network::well_known(name) {
+        Some(network) => Some(network.rpc_url),
+        None => Some(name.to_string()),
     }
 }
 
@@ -1251,6 +1253,7 @@ impl ForgePlugin for DoctorPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soroban_forge_core::config::{ForgeConfig, NetworkConfig};
 
     #[test]
     fn version_comparison() {
@@ -1441,6 +1444,82 @@ mod tests {
         let check = sdk_version_check(dir.path()).unwrap();
         assert_eq!(check.status, Status::Warn);
         assert!(check.detail.contains("no version specified"));
+    }
+
+    #[test]
+    fn config_network_url_resolves_mainnet_to_a_real_url() {
+        let config = ForgeConfig {
+            network: NetworkConfig {
+                name: Some("mainnet".into()),
+                rpc_url: None,
+                passphrase: None,
+            },
+            ..Default::default()
+        };
+        let url = config_network_url(Some(&config)).expect("mainnet must resolve");
+        assert_ne!(
+            url, "mainnet",
+            "mainnet must not resolve to the literal network name (#485)"
+        );
+        assert!(
+            url.starts_with("http"),
+            "mainnet must resolve to a real RPC URL, got {url:?}"
+        );
+    }
+
+    #[test]
+    fn config_network_url_matches_network_crate_for_well_known_names() {
+        for name in ["testnet", "futurenet", "mainnet", "localnet"] {
+            let config = ForgeConfig {
+                network: NetworkConfig {
+                    name: Some(name.into()),
+                    rpc_url: None,
+                    passphrase: None,
+                },
+                ..Default::default()
+            };
+            let url = config_network_url(Some(&config)).expect("well-known name must resolve");
+            let expected = soroban_forge_network::well_known(name)
+                .expect("network crate must know this name")
+                .rpc_url;
+            assert_eq!(
+                url, expected,
+                "doctor and the network crate must not drift for {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_network_url_prefers_explicit_rpc_url() {
+        let config = ForgeConfig {
+            network: NetworkConfig {
+                name: Some("mainnet".into()),
+                rpc_url: Some("https://example.com/custom".into()),
+                passphrase: None,
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            config_network_url(Some(&config)).as_deref(),
+            Some("https://example.com/custom")
+        );
+    }
+
+    #[test]
+    fn config_network_url_keeps_unknown_names_as_literals() {
+        let config = ForgeConfig {
+            network: NetworkConfig {
+                name: Some("my-private-net".into()),
+                rpc_url: None,
+                passphrase: None,
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            config_network_url(Some(&config)).as_deref(),
+            Some("my-private-net"),
+            "an unknown name with no rpc_url has nothing else to fall back to"
+        );
     }
 
     #[test]
