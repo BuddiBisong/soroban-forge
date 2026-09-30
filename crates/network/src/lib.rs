@@ -85,15 +85,15 @@ pub fn load_store(path: &PathBuf) -> Result<NetworkStore> {
 }
 
 /// Save the network store to disk, creating parent directories as needed.
+///
+/// Writes through [`soroban_forge_core::atomic::write_atomic`] (#470): the same
+/// non-atomic `fs::write` as the identity store, so a crash mid-write could
+/// leave `networks.json` unparseable.
 pub fn save_store(path: &PathBuf, store: &NetworkStore) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(ForgeError::io(format!("creating {}", parent.display())))?;
-    }
     let json = serde_json::to_string_pretty(store)
         .map_err(|e| ForgeError::Other(format!("serializing network store: {e}")))?;
-    std::fs::write(path, json)
-        .map_err(ForgeError::io(format!("writing {}", path.display())))
+    soroban_forge_core::atomic::write_atomic(path, &json)
+        .map_err(|e| ForgeError::Other(format!("writing {}: {e}", path.display())))
 }
 
 /// Resolve a network by name: check the user store first, then fall back to
