@@ -775,6 +775,76 @@ pub fn format_header_label(label: &str) -> String {
     format!("contract interface — {label}\n\n")
 }
 
+/// Filter a JSON spec string to include only the entry for `name`.
+///
+/// Returns `Ok(Some(entry_json))` when found, `Ok(None)` when the spec is
+/// empty JSON (so callers can distinguish "no functions at all" from
+/// "function not found"), or `Err` when `spec_json` is not valid JSON.
+///
+/// On a miss, also returns the list of available entrypoint names so the
+/// error message can suggest what is there.
+pub fn find_entrypoint_in_spec(
+    spec_json: &str,
+    name: &str,
+) -> Result<std::result::Result<serde_json::Value, Vec<String>>> {
+    let entries: serde_json::Value = serde_json::from_str(spec_json)
+        .map_err(|e| ForgeError::InvalidArgument(format!("could not parse contract spec JSON: {e}")))?;
+    let entries = entries
+        .as_array()
+        .ok_or_else(|| ForgeError::InvalidArgument("contract spec JSON is not an array".into()))?;
+
+    let mut available: Vec<String> = Vec::new();
+    for entry in entries {
+        if let Some(function) = entry.get("function_v0") {
+            let fn_name = function
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if fn_name == name {
+                return Ok(Ok(entry.clone()));
+            }
+            available.push(fn_name.to_string());
+        }
+    }
+    Ok(Err(available))
+}
+
+/// Format the single-entrypoint JSON as the output mode requires.
+///
+/// For `SpecFormat::Json` the raw JSON entry is printed.
+/// For `SpecFormat::Rust` / `SpecFormat::Markdown` the single entry is
+/// re-wrapped in an array so the existing helpers receive a valid spec
+/// document.
+pub fn format_single_entrypoint(entry: &serde_json::Value, format: SpecFormat) -> Result<String> {
+    match format {
+        SpecFormat::Json => Ok(serde_json::to_string_pretty(entry)
+            .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+            + "\n"),
+        SpecFormat::Rust | SpecFormat::Markdown => {
+            // Re-wrap as a one-element array so `render_markdown_spec` and
+            // the Rust listing path both work without modification.
+            let wrapped = serde_json::to_string(&serde_json::Value::Array(vec![entry.clone()]))
+                .map_err(|e| ForgeError::Other(format!("serialising entry: {e}")))?;
+            match format {
+                SpecFormat::Markdown => render_markdown_spec(&wrapped),
+                _ => {
+                    // For the Rust listing we still need the JSON; the stellar
+                    // CLI emits the Rust listing natively, so we cannot
+                    // reconstruct it without calling `stellar`. Return the
+                    // entry signature as a plain text line instead.
+                    let sig = entrypoint_signature(entry)?;
+                    let name = entry
+                        .get("function_v0")
+                        .and_then(|f| f.get("name"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?");
+                    Ok(format!("fn {name}{sig}\n"))
+                }
+            }
+        }
+    }
+}
+
 /// The `spec` subcommand.
 pub struct SpecPlugin;
 
@@ -793,6 +863,7 @@ impl ForgePlugin for SpecPlugin {
                  When a contract ID is provided, fetches the deployed wasm from the \
                  network first. Otherwise reads the spec out of the built wasm \
                  (run `stellar contract build` first).\n\n\
+                 Pass --entrypoint <NAME> to print only that one function signature. \
                  Pass --format md to render documentation-ready Markdown tables, or \
                  the global --json flag for machine-readable output.",
             )
@@ -821,6 +892,13 @@ impl ForgePlugin for SpecPlugin {
                 Arg::new("contract")
                     .long("contract")
                     .help("Contract name to target in a multi-contract workspace [default: the only contract if unique]"),
+            )
+            .arg(
+                Arg::new("entrypoint")
+                    .long("entrypoint")
+                    .short('e')
+                    .value_name("NAME")
+                    .help("Print only the signature of this one entrypoint; fails with the available list if not found"),
             )
             .arg(
                 Arg::new("network")
@@ -901,6 +979,7 @@ impl ForgePlugin for SpecPlugin {
         }
 
         let format = resolve_format(matches, ctx)?;
+        let entrypoint_filter = matches.get_one::<String>("entrypoint").cloned();
 
         let network = NetworkArgs::resolve(
             matches.get_one::<String>("network").cloned(),
@@ -908,13 +987,21 @@ impl ForgePlugin for SpecPlugin {
             matches.get_one::<String>("network-passphrase").cloned(),
         );
 
+        // When --entrypoint is given we always need the JSON form of the full
+        // spec so we can filter it; the final output format is applied after.
+        let fetch_format = if entrypoint_filter.is_some() {
+            SpecFormat::Json
+        } else {
+            format
+        };
+
         let (source_label, interface) = match contract_id {
             Some(id) => {
                 let temp = tempfile::tempdir()
                     .map_err(ForgeError::io("creating temporary directory"))?;
                 let fetched_wasm = temp.path().join("onchain.wasm");
                 fetch_onchain_wasm(id, &network, &fetched_wasm, ctx.timeout())?;
-                let output = dump_interface_from_wasm(&fetched_wasm, format)?;
+                let output = dump_interface_from_wasm(&fetched_wasm, fetch_format)?;
                 (id.clone(), output)
             }
             None => {
@@ -923,10 +1010,34 @@ impl ForgePlugin for SpecPlugin {
                     .map(|p| ctx.cwd.join(p))
                     .unwrap_or_else(|| ctx.cwd.clone());
                 let wasm_override = matches.get_one::<String>("wasm").map(|p| ctx.cwd.join(p));
-                let (wasm_path, output) = dump_interface(&dir, wasm_override.as_deref(), format)?;
+                let (wasm_path, output) = dump_interface(&dir, wasm_override.as_deref(), fetch_format)?;
                 (wasm_path.display().to_string(), output)
             }
         };
+
+        // --entrypoint: filter to one function and re-format.
+        if let Some(ref name) = entrypoint_filter {
+            let lookup = find_entrypoint_in_spec(&interface, name)?;
+            let entry = match lookup {
+                Ok(entry) => entry,
+                Err(available) => {
+                    let list = if available.is_empty() {
+                        "no entrypoints defined".to_string()
+                    } else {
+                        format!("available entrypoints: {}", available.join(", "))
+                    };
+                    return Err(ForgeError::InvalidArgument(format!(
+                        "entrypoint `{name}` not found in the contract interface; {list}"
+                    )));
+                }
+            };
+            let output = format_single_entrypoint(&entry, format)?;
+            print!("{output}");
+            if !output.ends_with('\n') {
+                println!();
+            }
+            return Ok(());
+        }
 
         if ctx.json || format == SpecFormat::Json {
             print!("{interface}");
@@ -1264,6 +1375,88 @@ mod tests {
 
         // Unreferenced type is excluded
         assert!(!md.contains("UnusedError"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #279 — --entrypoint
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn find_entrypoint_returns_matching_entry() {
+        let spec_json = serde_json::json!([
+            { "function_v0": { "name": "transfer", "inputs": [{"name":"to","type":"address"},{"name":"amount","type":"i128"}], "outputs": [] } },
+            { "function_v0": { "name": "balance",  "inputs": [{"name":"id","type":"address"}], "outputs": ["i128"] } }
+        ]);
+        let json = serde_json::to_string(&spec_json).unwrap();
+        let result = find_entrypoint_in_spec(&json, "transfer").unwrap();
+        let entry = result.unwrap();
+        assert_eq!(
+            entry["function_v0"]["name"].as_str().unwrap(),
+            "transfer"
+        );
+    }
+
+    #[test]
+    fn find_entrypoint_returns_available_list_on_miss() {
+        let spec_json = serde_json::json!([
+            { "function_v0": { "name": "transfer", "inputs": [], "outputs": [] } },
+            { "function_v0": { "name": "balance",  "inputs": [], "outputs": [] } }
+        ]);
+        let json = serde_json::to_string(&spec_json).unwrap();
+        let result = find_entrypoint_in_spec(&json, "mint").unwrap();
+        let available = result.unwrap_err();
+        assert!(available.contains(&"transfer".to_string()));
+        assert!(available.contains(&"balance".to_string()));
+    }
+
+    #[test]
+    fn find_entrypoint_empty_spec_returns_empty_list() {
+        let json = "[]";
+        let result = find_entrypoint_in_spec(json, "anything").unwrap();
+        let available = result.unwrap_err();
+        assert!(available.is_empty());
+    }
+
+    #[test]
+    fn format_single_entrypoint_json_is_pretty_printed() {
+        let entry = serde_json::json!({
+            "function_v0": {
+                "name": "transfer",
+                "inputs": [{"name":"to","type":"address"}],
+                "outputs": []
+            }
+        });
+        let out = format_single_entrypoint(&entry, SpecFormat::Json).unwrap();
+        // Must be valid JSON
+        let _: serde_json::Value = serde_json::from_str(&out.trim()).unwrap();
+        assert!(out.contains("transfer"));
+    }
+
+    #[test]
+    fn format_single_entrypoint_rust_contains_fn_signature() {
+        let entry = serde_json::json!({
+            "function_v0": {
+                "name": "transfer",
+                "inputs": [{"name":"to","type":"address"},{"name":"amount","type":"i128"}],
+                "outputs": []
+            }
+        });
+        let out = format_single_entrypoint(&entry, SpecFormat::Rust).unwrap();
+        assert!(out.contains("transfer"), "{out}");
+        assert!(out.contains("to"), "{out}");
+        assert!(out.contains("amount"), "{out}");
+    }
+
+    #[test]
+    fn command_exposes_entrypoint_flag() {
+        let matches = SpecPlugin
+            .command()
+            .try_get_matches_from(vec!["spec", "--entrypoint", "transfer"])
+            .unwrap();
+        assert_eq!(
+            matches.get_one::<String>("entrypoint").map(String::as_str),
+            Some("transfer")
+        );
     }
 
     #[test]
