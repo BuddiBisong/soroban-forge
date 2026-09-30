@@ -13,6 +13,9 @@
 //! - when run inside a contract project: the project's `soroban-sdk`
 //!   version, compared against the version pinned into new projects
 //!   (`soroban_forge_scaffold::SOROBAN_SDK_VERSION`)
+//! - when run inside a cargo project: a `Cargo.lock` that version control
+//!   will carry, since a missing or gitignored lockfile leaves CI resolving
+//!   fresh dependency versions on every build
 //!
 //! With `--fix`, doctor will, after confirmation, run the subset of remedies
 //! that are safe to automate (`rustup target add`, `cargo install`), then
@@ -567,6 +570,104 @@ pub fn release_profile_checks(project_dir: &Path) -> Vec<Check> {
     checks
 }
 
+/// Whether git excludes the project's `Cargo.lock` from version control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockIgnored {
+    /// An ignore rule matches the lockfile and nothing has committed it.
+    Yes,
+    /// No ignore rule excludes it — including the case of a lockfile already
+    /// tracked, which git carries regardless of a matching rule.
+    No,
+    /// Could not tell: git is missing, or this is not a repository.
+    Unknown,
+}
+
+/// Classify a `Cargo.lock` probe into a report line.
+///
+/// A committed lockfile is what makes CI resolve the same dependency versions
+/// the contract was tested and audited against; without one, every build picks
+/// up whatever has been published since. That is a [`Status::Warn`] rather
+/// than a [`Status::Fail`] — the project still builds, just not reproducibly.
+///
+/// `present` is whether the file exists on disk; `ignored` is git's verdict on
+/// whether version control would carry it.
+pub fn classify_cargo_lock(present: bool, ignored: LockIgnored) -> Check {
+    match (present, ignored) {
+        (true, LockIgnored::Yes) => Check {
+            name: "Cargo.lock",
+            status: Status::Warn,
+            detail: "present but excluded by .gitignore — CI never sees it".into(),
+            fix: Some(
+                "remove the Cargo.lock entry from .gitignore, then: \
+                 git add -f Cargo.lock && git commit -m \"commit Cargo.lock\"",
+            ),
+        },
+        (true, LockIgnored::No) => Check {
+            name: "Cargo.lock",
+            status: Status::Pass,
+            detail: "present, and no ignore rule excludes it".into(),
+            fix: None,
+        },
+        (true, LockIgnored::Unknown) => Check {
+            name: "Cargo.lock",
+            status: Status::Pass,
+            detail: "present".into(),
+            fix: None,
+        },
+        (false, LockIgnored::Yes) => Check {
+            name: "Cargo.lock",
+            status: Status::Warn,
+            detail: "not found, and .gitignore excludes it".into(),
+            fix: Some(
+                "remove the Cargo.lock entry from .gitignore, then: \
+                 cargo generate-lockfile && git add Cargo.lock",
+            ),
+        },
+        (false, _) => Check {
+            name: "Cargo.lock",
+            status: Status::Warn,
+            detail: "not found — CI resolves fresh dependency versions".into(),
+            fix: Some("cargo generate-lockfile, then commit Cargo.lock"),
+        },
+    }
+}
+
+/// Ask git whether an ignore rule excludes `Cargo.lock` in `project_dir`.
+///
+/// `git check-ignore --quiet` answers in its exit status: 0 when a rule
+/// matches, 1 when none does, 128 outside a repository. A tracked file counts
+/// as *not* ignored even when a rule matches it, which is exactly the question
+/// asked here — a lockfile already in the index is version-controlled whatever
+/// `.gitignore` says.
+fn lock_ignored(project_dir: &Path) -> LockIgnored {
+    let output = std::process::Command::new("git")
+        .args(["check-ignore", "--quiet", "Cargo.lock"])
+        .current_dir(project_dir)
+        .output();
+    match output {
+        Ok(o) => match o.status.code() {
+            Some(0) => LockIgnored::Yes,
+            Some(1) => LockIgnored::No,
+            _ => LockIgnored::Unknown,
+        },
+        Err(_) => LockIgnored::Unknown,
+    }
+}
+
+/// Report whether the project has a `Cargo.lock` that version control carries.
+///
+/// Returns `None` (no report line at all) when `project_dir` is not a cargo
+/// project — there is no lockfile to expect.
+///
+/// Thin system-touching wrapper around [`classify_cargo_lock`].
+pub fn cargo_lock_check(project_dir: &Path) -> Option<Check> {
+    if !project_dir.join("Cargo.toml").is_file() {
+        return None;
+    }
+    let present = project_dir.join("Cargo.lock").is_file();
+    Some(classify_cargo_lock(present, lock_ignored(project_dir)))
+}
+
 /// Run a fast `cargo build --target wasm32v1-none` in `project_dir` and
 /// report whether it succeeds, with timing.
 ///
@@ -1089,6 +1190,10 @@ impl DoctorPlugin {
         }
         // Release profile size-optimisation checks (issue #48).
         checks.extend(release_profile_checks(&ctx.cwd));
+        // A committed lockfile, without which CI cannot reproduce a build.
+        if let Some(check) = cargo_lock_check(&ctx.cwd) {
+            checks.push(check);
+        }
         if do_build {
             if let Some(check) = wasm_build_check(&ctx.cwd) {
                 checks.push(check);
@@ -1769,6 +1874,115 @@ mod tests {
         for name in ["docker", "git identity"] {
             assert!(remedy(&fail(name)).is_none(), "{name}");
         }
+    }
+
+    // ---- Cargo.lock (reproducible CI builds) ----
+
+    /// A cargo project inside its own git repository, so `git check-ignore`
+    /// answers from this project's rules rather than an enclosing repo's.
+    /// `None` when git is unavailable, leaving the caller nothing to probe.
+    fn git_project(manifest: &str) -> Option<tempfile::TempDir> {
+        let dir = project_with_manifest(manifest);
+        let initialized = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        initialized.then_some(dir)
+    }
+
+    #[test]
+    fn lockfile_present_and_not_ignored_passes() {
+        let check = classify_cargo_lock(true, LockIgnored::No);
+        assert_eq!(check.status, Status::Pass);
+        assert!(check.fix.is_none());
+    }
+
+    #[test]
+    fn lockfile_present_without_a_git_verdict_passes() {
+        // No git, or not a repository: there is a lockfile, and nothing
+        // suggests version control would drop it.
+        let check = classify_cargo_lock(true, LockIgnored::Unknown);
+        assert_eq!(check.status, Status::Pass);
+        assert!(check.fix.is_none());
+    }
+
+    #[test]
+    fn gitignored_lockfile_warns() {
+        let check = classify_cargo_lock(true, LockIgnored::Yes);
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("excluded by .gitignore"));
+        assert!(check.fix.unwrap().contains(".gitignore"));
+    }
+
+    #[test]
+    fn missing_lockfile_warns() {
+        let check = classify_cargo_lock(false, LockIgnored::No);
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("not found"));
+        assert!(check.fix.unwrap().contains("cargo generate-lockfile"));
+    }
+
+    #[test]
+    fn missing_and_gitignored_lockfile_reports_both() {
+        let check = classify_cargo_lock(false, LockIgnored::Yes);
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("not found"));
+        assert!(check.detail.contains(".gitignore"));
+        let fix = check.fix.unwrap();
+        assert!(fix.contains(".gitignore"));
+        assert!(fix.contains("cargo generate-lockfile"));
+    }
+
+    #[test]
+    fn lockfile_problems_never_fail_the_run() {
+        // Reproducibility is advisory: a project without a committed lockfile
+        // still builds, so doctor must not exit non-zero over it.
+        for ignored in [LockIgnored::Yes, LockIgnored::No, LockIgnored::Unknown] {
+            assert_eq!(failure_count(&[classify_cargo_lock(false, ignored)]), 0);
+            assert_eq!(failure_count(&[classify_cargo_lock(true, ignored)]), 0);
+        }
+    }
+
+    #[test]
+    fn lockfile_check_skipped_outside_a_cargo_project() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(cargo_lock_check(dir.path()).is_none());
+    }
+
+    #[test]
+    fn lockfile_check_warns_when_the_project_has_no_lockfile() {
+        // The acceptance case, through the real wrapper: a cargo project with
+        // no Cargo.lock warns whatever git says about the path.
+        let dir = project_with_manifest("[package]\nname = \"x\"\nversion = \"0.1.0\"\n");
+        let check = cargo_lock_check(dir.path()).unwrap();
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("not found"));
+    }
+
+    #[test]
+    fn lockfile_check_reads_gitignore_from_the_project_repository() {
+        let Some(dir) = git_project("[package]\nname = \"x\"\nversion = \"0.1.0\"\n") else {
+            return; // git unavailable — nothing to probe
+        };
+        std::fs::write(dir.path().join("Cargo.lock"), "version = 4\n").unwrap();
+
+        // Present, with no rule excluding it: version control will carry it.
+        assert_eq!(cargo_lock_check(dir.path()).unwrap().status, Status::Pass);
+
+        // The same lockfile, now excluded — CI would never see it.
+        std::fs::write(dir.path().join(".gitignore"), "Cargo.lock\n").unwrap();
+        let check = cargo_lock_check(dir.path()).unwrap();
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("excluded by .gitignore"));
+    }
+
+    #[test]
+    fn lockfile_is_not_auto_fixable() {
+        // `cargo generate-lockfile` is safe to run, but committing the result
+        // is the user's call — so this is reported, never auto-fixed.
+        assert!(remedy(&fail("Cargo.lock")).is_none());
     }
 
     // ---- auto-fix (`--fix`) ----
