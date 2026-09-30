@@ -2,6 +2,7 @@
 
 - [soroban-forge Documentation](README.md)
 - [Getting Started](getting-started.md)
+  - [Install via Homebrew](install-homebrew.md)
 - [Quickstart](quickstart.md)
 - [Zero to Deployed Testnet Tutorial](tutorial-zero-to-testnet.md)
 - [Architecture](architecture.md)
@@ -30,7 +31,7 @@
 - [SDK Upgrades & Migrations](upgrade-guide.md)
   - [Contract WASM Upgrades](upgrades.md)
 - [DX & Developer Tooling](tooling.md)
-- [CLI Cookbook](cookbook.md)
+  - [Generating the CHANGELOG](changelog.md)
 - [Troubleshooting & FAQ](troubleshooting.md)
   - [FAQ](faq.md)
 - [Releasing (maintainers)](releasing.md)
