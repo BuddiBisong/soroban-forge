@@ -446,14 +446,16 @@ impl ForgePlugin for InvokePlugin {
                 "Call a function on a deployed contract with `stellar contract invoke`.\n\n\
                  Everything after <FN> is forwarded verbatim as that function's arguments, \
                  so --source/--network/etc. must be given before <CONTRACT_ID> and <FN>:\n\n  \
-                 soroban-forge invoke --source alice <CONTRACT_ID> transfer --to G... --amount 100",
+                 soroban-forge invoke --source alice <CONTRACT_ID> transfer --to G... --amount 100\n\n\
+                 When <CONTRACT_ID> is omitted, the most recently deployed contract ID recorded \
+                 in deployments.json (written by `soroban-forge deploy`) is used.",
             )
             .trailing_var_arg(true)
             .arg(
                 Arg::new("contract-id")
-                    .required(true)
+                    .required(false)
                     .value_name("CONTRACT_ID")
-                    .help("Deployed contract ID (C…)"),
+                    .help("Deployed contract ID (C…); omit to fall back to the last ID in deployments.json"),
             )
             .arg(
                 Arg::new("function")
@@ -494,6 +496,11 @@ impl ForgePlugin for InvokePlugin {
                     .help("Network passphrase for --rpc-url"),
             )
             .arg(
+                Arg::new("path")
+                    .long("path")
+                    .help("Contract project directory for deployments.json lookup [default: current directory]"),
+            )
+            .arg(
                 Arg::new("args-file")
                     .long("args-file")
                     .value_name("PATH")
@@ -527,9 +534,35 @@ impl ForgePlugin for InvokePlugin {
             ));
         }
 
-        let contract_id = matches
-            .get_one::<String>("contract-id")
-            .expect("contract-id is required by clap");
+        let network = NetworkArgs::resolve(
+            matches.get_one::<String>("network").cloned(),
+            matches.get_one::<String>("rpc-url").cloned(),
+            matches.get_one::<String>("network-passphrase").cloned(),
+        );
+
+        // Issue #281: fall back to the recorded contract ID when none is given.
+        let contract_id = match matches.get_one::<String>("contract-id") {
+            Some(id) => id.clone(),
+            None => {
+                let dir = matches
+                    .get_one::<String>("path")
+                    .map(|p| ctx.cwd.join(p))
+                    .unwrap_or_else(|| ctx.cwd.clone());
+                soroban_forge_deploy::lookup_recorded_contract_id(
+                    &dir,
+                    &soroban_forge_deploy::read_crate_name(&dir).unwrap_or_default(),
+                    &network.network.clone().unwrap_or_else(|| DEFAULT_NETWORK.to_string()),
+                )
+                .ok_or_else(|| {
+                    ForgeError::InvalidArgument(
+                        "no contract-id given and no deployment recorded in deployments.json — \
+                         run `soroban-forge deploy` first or pass a contract ID explicitly"
+                            .into(),
+                    )
+                })?
+            }
+        };
+
         let function = matches
             .get_one::<String>("function")
             .expect("function is required by clap");
@@ -541,12 +574,6 @@ impl ForgePlugin for InvokePlugin {
         let source = matches
             .get_one::<String>("source")
             .expect("source is required by clap");
-
-        let network = NetworkArgs::resolve(
-            matches.get_one::<String>("network").cloned(),
-            matches.get_one::<String>("rpc-url").cloned(),
-            matches.get_one::<String>("network-passphrase").cloned(),
-        );
 
         // Issue #284: merge --args-file with inline args (inline wins).
         let fn_args = if let Some(args_path) = matches.get_one::<String>("args-file") {
@@ -560,7 +587,7 @@ impl ForgePlugin for InvokePlugin {
             // Issue #285: simulate and pretty-print.
             let sim =
                 run_stellar_simulate(
-                contract_id,
+                &contract_id,
                 source,
                 &network,
                 function,
@@ -615,7 +642,7 @@ impl ForgePlugin for InvokePlugin {
         }
 
         run_stellar_invoke(
-            contract_id,
+            &contract_id,
             source,
             &network,
             function,
