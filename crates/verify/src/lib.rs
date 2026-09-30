@@ -45,6 +45,7 @@ pub const CONTRACT_ID_LEN: usize = 56;
 
 /// Every wasm module starts with these four bytes.
 const WASM_MAGIC: &[u8] = b"\0asm";
+const WASM_VERSION_1: &[u8] = b"\x01\0\0\0";
 
 #[derive(Deserialize)]
 struct Manifest {
@@ -107,10 +108,8 @@ pub fn resolve_local_wasm(dir: &Path, wasm_override: Option<&Path>) -> Result<Pa
     Ok(wasm_path)
 }
 
-/// Cheap shape check on a strkey contract ID so an obvious typo fails before
-/// we shell out to the network. Contract IDs are 56 base32 characters
-/// starting with `C`; the checksum is left to the `stellar` CLI, which
-/// decodes the strkey for real.
+/// Validate both the shape and StrKey checksum locally, before any network
+/// call or stellar-cli invocation.
 pub fn validate_contract_id(id: &str) -> Result<()> {
     let invalid = |reason: &str| {
         Err(ForgeError::InvalidArgument(format!(
@@ -130,6 +129,11 @@ pub fn validate_contract_id(id: &str) -> Result<()> {
     {
         return invalid("contains characters outside the base32 alphabet");
     }
+    if stellar_strkey::Contract::from_string(id).is_err() {
+        return Err(ForgeError::InvalidArgument(format!(
+            "`{id}` is not a valid contract ID (checksum failure)"
+        )));
+    }
     Ok(())
 }
 
@@ -148,9 +152,17 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 pub fn hash_wasm_file(path: &Path) -> Result<String> {
     let bytes =
         std::fs::read(path).map_err(ForgeError::io(format!("reading {}", path.display())))?;
-    if !bytes.starts_with(WASM_MAGIC) {
+    if bytes.len() < WASM_MAGIC.len() || !bytes.starts_with(WASM_MAGIC) {
         return Err(ForgeError::InvalidArgument(format!(
             "{} is not a wasm module (missing the \\0asm header)",
+            path.display()
+        )));
+    }
+    if bytes.len() < WASM_MAGIC.len() + WASM_VERSION_1.len()
+        || &bytes[WASM_MAGIC.len()..WASM_MAGIC.len() + WASM_VERSION_1.len()] != WASM_VERSION_1
+    {
+        return Err(ForgeError::InvalidArgument(format!(
+            "{} is a corrupted wasm module (expected version 1 header)",
             path.display()
         )));
     }
@@ -185,7 +197,7 @@ impl NetworkArgs {
         from_config: Option<&ConfigNetwork>,
     ) -> Self {
         let cfg = from_config.cloned().unwrap_or_default();
-        let cli_network = network;
+        let cli_network = network.map(normalize_network_name);
         let cli_rpc = rpc_url;
         let network = match (cli_network.as_ref(), cli_rpc.as_ref()) {
             (Some(name), _) => Some(name.clone()),
@@ -229,6 +241,16 @@ impl NetworkArgs {
             args.push(passphrase.clone());
         }
         args
+    }
+}
+
+/// Normalize only well-known stellar-cli network presets. Custom named
+/// networks may be case-sensitive, so they pass through untouched.
+fn normalize_network_name(value: String) -> String {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "testnet" | "mainnet" | "futurenet" | "standalone" => normalized,
+        _ => value,
     }
 }
 
@@ -835,7 +857,8 @@ impl ForgePlugin for VerifyPlugin {
             .expect("contract-id is required by clap")
             .collect();
 
-        if ctx.offline {
+        let wasm_hash = matches.get_one::<String>("wasm-hash");
+        if ctx.offline && wasm_hash.is_none() {
             return Err(ForgeError::InvalidArgument(
                 "verify is unavailable in offline mode because it must fetch deployed wasm".into(),
             ));
@@ -853,6 +876,26 @@ impl ForgePlugin for VerifyPlugin {
             matches.get_one::<String>("network-passphrase").cloned(),
             ctx.config.as_ref().map(|c| &c.network),
         );
+
+        // Issue #281: fall back to recorded contract ID when none is given.
+        let contract_id: String = match matches.get_one::<String>("contract-id") {
+            Some(id) => id.clone(),
+            None => {
+                let crate_name = read_crate_name(&dir).unwrap_or_default();
+                let net_label = network
+                    .network
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_NETWORK.to_string());
+                soroban_forge_deploy::lookup_recorded_contract_id(&dir, &crate_name, &net_label)
+                    .ok_or_else(|| {
+                        ForgeError::InvalidArgument(
+                            "no contract-id given and no deployment recorded in deployments.json — \
+                             run `soroban-forge deploy` first or pass a contract ID explicitly"
+                                .into(),
+                        )
+                    })?
+            }
+        };
 
         let reproducible = matches.get_flag("reproducible");
         let keep_fetched = matches
@@ -916,8 +959,7 @@ impl ForgePlugin for VerifyPlugin {
 mod tests {
     use super::*;
 
-    /// A syntactically valid contract ID (shape only — no real checksum).
-    const VALID_ID: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const VALID_ID: &str = "CA3D5KRYM6CB7OWQ6TWYRR3Z4T7GNZLKERYNZGGA5SOAOPIFY6YQGAXE";
 
     fn wasm_bytes(payload: &[u8]) -> Vec<u8> {
         let mut bytes = b"\0asm\x01\0\0\0".to_vec();
@@ -958,6 +1000,16 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_wasm_with_a_corrupted_version_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("corrupt.wasm");
+        std::fs::write(&path, b"\0asm\x02\0\0\0payload").unwrap();
+
+        let err = hash_wasm_file(&path).unwrap_err();
+        assert!(err.to_string().contains("corrupted wasm"), "{err}");
+    }
+
+    #[test]
     fn accepts_a_well_formed_contract_id() {
         assert!(validate_contract_id(VALID_ID).is_ok());
     }
@@ -982,6 +1034,13 @@ mod tests {
                 soroban_forge_core::error::ExitCode::UserError
             );
         }
+    }
+
+    #[test]
+    fn rejects_a_shape_valid_contract_id_with_an_invalid_checksum() {
+        let err = validate_contract_id("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+            .unwrap_err();
+        assert!(err.to_string().contains("checksum failure"), "{err}");
     }
 
     #[test]
@@ -1085,6 +1144,12 @@ mod tests {
     fn an_explicit_network_is_passed_through() {
         let network = NetworkArgs::resolve(Some("mainnet".into()), None, None, None);
         assert_eq!(network.cli_args(), vec!["--network", "mainnet"]);
+    }
+
+    #[test]
+    fn normalizes_well_known_network_names() {
+        let network = NetworkArgs::resolve(Some("  TestNet  ".into()), None, None, None);
+        assert_eq!(network.cli_args(), vec!["--network", "testnet"]);
     }
 
     #[test]
