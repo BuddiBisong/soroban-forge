@@ -54,6 +54,7 @@ impl ForgeContext {
     /// `config_path`, when set (from `--config`), is loaded directly and
     /// errors if missing/invalid. Otherwise `forge.toml` is discovered by
     /// walking up from `cwd`, same as before.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_options(
         cwd: PathBuf,
         verbose: u8,
@@ -136,14 +137,16 @@ mod tests {
     #[test]
     fn context_accepts_explicit_quiet_mode() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = ForgeContext::with_output(dir.path().to_path_buf(), 0, true, false, false).unwrap();
+        let ctx =
+            ForgeContext::with_output(dir.path().to_path_buf(), 0, true, false, false).unwrap();
         assert!(ctx.quiet);
     }
 
     #[test]
     fn context_accepts_explicit_json_mode() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = ForgeContext::with_output(dir.path().to_path_buf(), 0, false, true, false).unwrap();
+        let ctx =
+            ForgeContext::with_output(dir.path().to_path_buf(), 0, false, true, false).unwrap();
         assert!(ctx.json);
     }
 
@@ -166,7 +169,8 @@ mod tests {
     #[test]
     fn context_accepts_explicit_yes_mode() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = ForgeContext::with_output(dir.path().to_path_buf(), 0, false, false, true).unwrap();
+        let ctx =
+            ForgeContext::with_output(dir.path().to_path_buf(), 0, false, false, true).unwrap();
         assert!(ctx.yes);
     }
 

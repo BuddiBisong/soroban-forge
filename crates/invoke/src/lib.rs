@@ -418,7 +418,9 @@ fn run_stellar_invoke(
         Ok(s) if s.success() => Ok(()),
         Ok(s) => Err(ForgeError::Other(format!(
             "stellar contract invoke exited with status {}",
-            s.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into())
+            s.code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".into())
         ))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             Err(ForgeError::ToolMissing("stellar-cli".into()))
@@ -566,8 +568,7 @@ impl ForgePlugin for InvokePlugin {
         // conceptually; in practice it still needs a live RPC endpoint.
         if ctx.offline && !simulate {
             return Err(ForgeError::InvalidArgument(
-                "invoke is unavailable in offline mode because it calls a deployed contract"
-                    .into(),
+                "invoke is unavailable in offline mode because it calls a deployed contract".into(),
             ));
         }
 
@@ -772,15 +773,30 @@ mod tests {
             "alice",
             &network,
             "transfer",
-            &["--to".to_string(), "GABC".to_string(), "--amount".to_string(), "100".to_string()],
+            &[
+                "--to".to_string(),
+                "GABC".to_string(),
+                "--amount".to_string(),
+                "100".to_string(),
+            ],
         );
         assert_eq!(
             args,
             vec![
-                "contract", "invoke", "--id",
+                "contract",
+                "invoke",
+                "--id",
                 "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                "--source", "alice", "--network", "testnet", "--",
-                "transfer", "--to", "GABC", "--amount", "100",
+                "--source",
+                "alice",
+                "--network",
+                "testnet",
+                "--",
+                "transfer",
+                "--to",
+                "GABC",
+                "--amount",
+                "100",
             ]
         );
     }
@@ -1006,10 +1022,7 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(matches.get_one::<String>("source").unwrap(), "alice");
-        assert_eq!(
-            matches.get_one::<String>("function").unwrap(),
-            "transfer"
-        );
+        assert_eq!(matches.get_one::<String>("function").unwrap(), "transfer");
         let args: Vec<&String> = matches.get_many::<String>("args").unwrap().collect();
         assert_eq!(args, vec!["--to", "GABC", "--amount", "100"]);
     }
