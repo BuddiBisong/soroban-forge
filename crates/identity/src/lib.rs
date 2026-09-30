@@ -1,7 +1,7 @@
 //! # soroban-forge-identity
 //!
-//! `soroban-forge identity generate|list|fund` — manage test keypairs and
-//! fund them via friendbot on testnet.
+//! `soroban-forge identity generate|list|fund|remove` — manage test keypairs
+//! and fund them via friendbot on testnet.
 //!
 //! Identities are stored as a JSON file at
 //! `~/.config/soroban-forge/identities.json`.
@@ -60,6 +60,16 @@ pub fn save_store(path: &PathBuf, store: &IdentityStore) -> Result<()> {
         .map_err(|e| ForgeError::Other(format!("serializing identity store: {e}")))?;
     std::fs::write(path, json)
         .map_err(ForgeError::io(format!("writing {}", path.display())))
+}
+
+fn remove_identity(path: &PathBuf, name: &str) -> Result<()> {
+    let mut store = load_store(path)?;
+    if store.identities.remove(name).is_none() {
+        return Err(ForgeError::InvalidArgument(format!(
+            "identity `{name}` not found (use `soroban-forge identity list` to see available identities)"
+        )));
+    }
+    save_store(path, &store)
 }
 
 /// Generate a new Stellar keypair and return `(public_key, secret_key)` as
@@ -216,6 +226,15 @@ impl ForgePlugin for IdentityPlugin {
                             .help("Network passphrase (used to refuse mainnet funding)"),
                     ),
             )
+            .subcommand(
+                Command::new("remove")
+                    .about("Remove a stored identity")
+                    .arg(
+                        Arg::new("name")
+                            .help("Name of the identity to remove")
+                            .required(true),
+                    ),
+            )
     }
 
     fn run(&self, matches: &ArgMatches, ctx: &ForgeContext) -> Result<()> {
@@ -308,6 +327,18 @@ impl ForgePlugin for IdentityPlugin {
                     } else {
                         print!("{}", format_list(&store));
                     }
+                }
+                Ok(())
+            }
+
+            Some(("remove", sub)) => {
+                let name = sub.get_one::<String>("name").unwrap();
+                remove_identity(&path, name)?;
+
+                if ctx.json {
+                    println!("{}", serde_json::json!({ "name": name, "removed": true }));
+                } else if !ctx.quiet {
+                    println!("removed identity `{name}`");
                 }
                 Ok(())
             }
@@ -424,6 +455,32 @@ mod tests {
         let path = dir.path().join("does-not-exist.json");
         let store = load_store(&path).unwrap();
         assert!(store.identities.is_empty());
+    }
+
+    #[test]
+    fn remove_identity_updates_store_and_rejects_missing_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identities.json");
+        let mut store = IdentityStore::default();
+        for name in ["alice", "bob"] {
+            store.identities.insert(
+                name.into(),
+                Identity {
+                    public_key: format!("G{name}"),
+                    secret_key: format!("S{name}"),
+                },
+            );
+        }
+        save_store(&path, &store).unwrap();
+
+        remove_identity(&path, "alice").unwrap();
+
+        let updated = load_store(&path).unwrap();
+        assert!(!updated.identities.contains_key("alice"));
+        assert_eq!(updated.identities["bob"].public_key, "Gbob");
+
+        let error = remove_identity(&path, "carol").unwrap_err();
+        assert!(error.to_string().contains("identity `carol` not found"));
     }
 
     #[test]
@@ -557,6 +614,7 @@ mod tests {
         assert!(sub_names.contains(&"generate"));
         assert!(sub_names.contains(&"list"));
         assert!(sub_names.contains(&"fund"));
+        assert!(sub_names.contains(&"remove"));
     }
 
     // #287 — fund refuses offline
