@@ -424,6 +424,17 @@ fn run_stellar_info(wasm: &Path, format: SpecFormat) -> Result<String> {
     }
 }
 
+/// Escape a contract-supplied identifier for use inside a Markdown table cell.
+///
+/// Names and types come from the contract's own wasm spec, so they are
+/// untrusted from this tool's point of view. A literal `|` would add a column
+/// and a backtick would close the inline-code span early, either of which
+/// breaks the generated table or lets contract text alter how the doc renders
+/// once embedded in a README (#483).
+fn escape_markdown_cell(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('|', "\\|").replace('`', "\\`")
+}
+
 /// Render a type definition into a compact, human-readable string.
 pub fn render_type(ty: &serde_json::Value) -> String {
     use serde_json::Value;
@@ -669,23 +680,34 @@ pub fn render_markdown_spec(spec_json: &str) -> Result<String> {
             } else {
                 func.inputs
                     .iter()
-                    .map(|(n, t)| format!("`{n}: {t}`"))
+                    .map(|(n, t)| {
+                        format!(
+                            "`{}: {}`",
+                            escape_markdown_cell(n),
+                            escape_markdown_cell(t)
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(", ")
             };
             let ret_col = match func.outputs.as_slice() {
                 [] => "-".to_string(),
-                [single] => format!("`{single}`"),
+                [single] => format!("`{}`", escape_markdown_cell(single)),
                 many => {
                     let wrapped = many
                         .iter()
-                        .map(|t| format!("`{t}`"))
+                        .map(|t| format!("`{}`", escape_markdown_cell(t)))
                         .collect::<Vec<_>>()
                         .join(", ");
                     format!("({wrapped})")
                 }
             };
-            md.push_str(&format!("| `{}` | {} | {} |\n", func.name, args_col, ret_col));
+            md.push_str(&format!(
+                "| `{}` | {} | {} |\n",
+                escape_markdown_cell(&func.name),
+                args_col,
+                ret_col
+            ));
         }
     }
 
@@ -702,33 +724,49 @@ pub fn render_markdown_spec(spec_json: &str) -> Result<String> {
 
         for name in &referenced {
             if let Some(s) = structs.get(name) {
-                md.push_str(&format!("\n### `{name}` (Struct)\n\n"));
+                md.push_str(&format!("\n### `{}` (Struct)\n\n", escape_markdown_cell(name)));
                 md.push_str("| Field | Type |\n");
                 md.push_str("| --- | --- |\n");
                 for (fname, ftype) in &s.fields {
-                    md.push_str(&format!("| `{fname}` | `{ftype}` |\n"));
+                    md.push_str(&format!(
+                        "| `{}` | `{}` |\n",
+                        escape_markdown_cell(fname),
+                        escape_markdown_cell(ftype)
+                    ));
                 }
             } else if let Some(e) = enums.get(name) {
-                md.push_str(&format!("\n### `{name}` (Enum)\n\n"));
+                md.push_str(&format!("\n### `{}` (Enum)\n\n", escape_markdown_cell(name)));
                 md.push_str("| Variant | Value |\n");
                 md.push_str("| --- | --- |\n");
                 for (vname, vval) in &e.cases {
-                    md.push_str(&format!("| `{vname}` | `{vval}` |\n"));
+                    md.push_str(&format!(
+                        "| `{}` | `{vval}` |\n",
+                        escape_markdown_cell(vname)
+                    ));
                 }
             } else if let Some(err) = error_enums.get(name) {
-                md.push_str(&format!("\n### `{name}` (Error)\n\n"));
+                md.push_str(&format!("\n### `{}` (Error)\n\n", escape_markdown_cell(name)));
                 md.push_str("| Error | Code |\n");
                 md.push_str("| --- | --- |\n");
                 for (ename, eval) in &err.cases {
-                    md.push_str(&format!("| `{ename}` | `{eval}` |\n"));
+                    md.push_str(&format!(
+                        "| `{}` | `{eval}` |\n",
+                        escape_markdown_cell(ename)
+                    ));
                 }
             } else if let Some(u) = unions.get(name) {
-                md.push_str(&format!("\n### `{name}` (Union)\n\n"));
+                md.push_str(&format!("\n### `{}` (Union)\n\n", escape_markdown_cell(name)));
                 md.push_str("| Case | Type |\n");
                 md.push_str("| --- | --- |\n");
                 for (cname, ctype) in &u.cases {
-                    let type_cell = ctype.as_deref().map(|t| format!("`{t}`")).unwrap_or_else(|| "-".into());
-                    md.push_str(&format!("| `{cname}` | {type_cell} |\n"));
+                    let type_cell = ctype
+                        .as_deref()
+                        .map(|t| format!("`{}`", escape_markdown_cell(t)))
+                        .unwrap_or_else(|| "-".into());
+                    md.push_str(&format!(
+                        "| `{}` | {type_cell} |\n",
+                        escape_markdown_cell(cname)
+                    ));
                 }
             }
         }
@@ -1290,5 +1328,89 @@ mod tests {
         let md = render_markdown_spec(&serde_json::to_string(&spec_json).unwrap()).unwrap();
         assert!(md.contains("### `Batch` (Struct)"));
         assert!(md.contains("### `Item` (Struct)"));
+    }
+
+    #[test]
+    fn markdown_tables_escape_pipes_and_backticks_in_identifiers() {
+        // Contract-supplied names are untrusted input (#483): a literal `|` adds
+        // a column and a backtick ends the inline-code span early, so both must
+        // be escaped before they reach a table cell.
+        let spec_json = serde_json::json!([
+            {
+                "function_v0": {
+                    "name": "pip|e",
+                    "inputs": [
+                        { "name": "we|ird", "type": "u64" },
+                        { "name": "tick`y", "type": "bool" },
+                        { "name": "p", "type": { "udt": { "name": "Pi|pe" } } }
+                    ],
+                    "outputs": ["str|ing"]
+                }
+            },
+            {
+                "udt_struct_v0": {
+                    "name": "Pi|pe",
+                    "fields": [
+                        { "name": "fie|ld", "type": "u32" },
+                        { "name": "back`tick", "type": "u32" }
+                    ]
+                }
+            }
+        ]);
+
+        let md = render_markdown_spec(&serde_json::to_string(&spec_json).unwrap()).unwrap();
+
+        // The raw characters must not appear unescaped anywhere in the output.
+        assert!(
+            !md.contains("pip|e"),
+            "an unescaped pipe in a function name would add a table column"
+        );
+        assert!(
+            !md.contains("Pi|pe"),
+            "an unescaped pipe in a type name would add a table column"
+        );
+        assert!(
+            !md.contains("fie|ld"),
+            "an unescaped pipe in a field name would add a table column"
+        );
+        assert!(
+            !md.contains("back`tick"),
+            "an unescaped backtick in a field name would end the code span early"
+        );
+
+        // Every table row must have the same number of cells as its own header.
+        // Each table is checked separately: the entrypoints table has 3 columns
+        // and the custom-type tables have 2, so a single global count would be
+        // wrong. An escaped `\|` is content, not a separator, so it is masked
+        // before counting.
+        let mut current_table_cells: Option<usize> = None;
+        let mut tables_checked = 0;
+        for line in md.lines() {
+            if !line.starts_with('|') {
+                // A blank line or a heading ends the current table.
+                current_table_cells = None;
+                continue;
+            }
+            let cells = line.replace(r"\|", "\u{0}").split('|').count();
+            match current_table_cells {
+                None => {
+                    current_table_cells = Some(cells);
+                    tables_checked += 1;
+                }
+                Some(expected) => assert_eq!(
+                    cells, expected,
+                    "table row {line:?} has {cells} cells, expected {expected} - the table is malformed"
+                ),
+            }
+        }
+        assert!(
+            tables_checked >= 2,
+            "expected at least the entrypoints and struct tables, found {tables_checked}"
+        );
+
+        // The escaped forms are still present, so nothing was silently dropped.
+        assert!(md.contains(r"pip\|e"));
+        assert!(md.contains(r"fie\|ld"));
+        assert!(md.contains(r"back\`tick"));
     }
 }
