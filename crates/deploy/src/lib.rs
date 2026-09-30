@@ -12,8 +12,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use clap::{Arg, ArgMatches, Command};
-use serde::Deserialize;
+use clap::{Arg, ArgAction, ArgMatches, Command};
+use serde::{Deserialize, Serialize};
 use soroban_forge_core::{ForgeContext, ForgeError, ForgePlugin, Result};
 
 /// Network used when neither `--network` nor `--rpc-url` is given.
@@ -158,9 +158,16 @@ fn path_str(path: &Path) -> Result<&str> {
 /// Never reimplemented locally.
 ///
 /// Thin system-touching wrapper; not unit-tested.
-fn run_stellar_build(dir: &Path) -> Result<()> {
+pub fn build_stellar_build_args(build_args: &[String]) -> Vec<String> {
+    let mut args = vec!["contract".to_string(), "build".to_string()];
+    args.extend(build_args.iter().cloned());
+    args
+}
+
+fn run_stellar_build(dir: &Path, build_args: &[String]) -> Result<()> {
+    let args = build_stellar_build_args(build_args);
     let result = std::process::Command::new("stellar")
-        .args(["contract", "build"])
+        .args(&args)
         .current_dir(dir)
         .output();
 
@@ -183,6 +190,14 @@ fn run_stellar_build(dir: &Path) -> Result<()> {
 /// release build of the cargo project in `dir` — building it first with
 /// `stellar contract build` if it is not there yet.
 pub fn build_if_needed(dir: &Path, wasm_override: Option<&Path>) -> Result<PathBuf> {
+    build_if_needed_with_args(dir, wasm_override, &[])
+}
+
+fn build_if_needed_with_args(
+    dir: &Path,
+    wasm_override: Option<&Path>,
+    build_args: &[String],
+) -> Result<PathBuf> {
     if let Some(path) = wasm_override {
         return Ok(path.to_path_buf());
     }
@@ -190,7 +205,7 @@ pub fn build_if_needed(dir: &Path, wasm_override: Option<&Path>) -> Result<PathB
     let crate_name = read_crate_name(dir)?;
     let wasm_path = locate_wasm(dir, &crate_name);
     if !wasm_path.is_file() {
-        run_stellar_build(dir)?;
+        run_stellar_build(dir, build_args)?;
     }
     if !wasm_path.is_file() {
         return Err(ForgeError::Other(format!(
@@ -201,8 +216,39 @@ pub fn build_if_needed(dir: &Path, wasm_override: Option<&Path>) -> Result<PathB
     Ok(wasm_path)
 }
 
-/// Assemble the full `stellar contract deploy` argument list.
+/// Parse a `NAME=VALUE` constructor argument string into `(name, value)`.
+///
+/// Returns `Err` when the string does not contain `=` or the name part is
+/// empty, so a bare `=value` or a plain word fails fast with a clear message.
+pub fn parse_constructor_arg(raw: &str) -> Result<(String, String)> {
+    let eq = raw.find('=').ok_or_else(|| {
+        ForgeError::InvalidArgument(format!(
+            "constructor argument `{raw}` must be in NAME=VALUE form (e.g. admin=G...)"
+        ))
+    })?;
+    let name = raw[..eq].trim();
+    if name.is_empty() {
+        return Err(ForgeError::InvalidArgument(format!(
+            "constructor argument `{raw}` has an empty name; expected NAME=VALUE"
+        )));
+    }
+    Ok((name.to_string(), raw[eq + 1..].to_string()))
+}
+
+/// Assemble the full `stellar contract deploy` argument list, optionally
+/// including constructor arguments forwarded after `--`.
 pub fn build_deploy_args(wasm: &Path, source: &str, network: &NetworkArgs) -> Result<Vec<String>> {
+    build_deploy_args_with_alias(wasm, source, network, None)
+}
+
+/// Assemble the deploy command, optionally registering a stellar-cli alias
+/// for the resulting contract ID.
+pub fn build_deploy_args_with_alias(
+    wasm: &Path,
+    source: &str,
+    network: &NetworkArgs,
+    alias: Option<&str>,
+) -> Result<Vec<String>> {
     let wasm_str = path_str(wasm)?.to_string();
     let mut args = vec![
         "contract".to_string(),
@@ -212,7 +258,30 @@ pub fn build_deploy_args(wasm: &Path, source: &str, network: &NetworkArgs) -> Re
         "--source".to_string(),
         source.to_string(),
     ];
+    if let Some(alias) = alias {
+        args.push("--alias".to_string());
+        args.push(alias.to_string());
+    }
     args.extend(network.cli_args());
+    Ok(args)
+}
+
+/// Like [`build_deploy_args`] but appends constructor arguments after `--`
+/// when any are given.
+pub fn build_deploy_args_with_constructor(
+    wasm: &Path,
+    source: &str,
+    network: &NetworkArgs,
+    constructor_args: &[(String, String)],
+) -> Result<Vec<String>> {
+    let mut args = build_deploy_args(wasm, source, network)?;
+    if !constructor_args.is_empty() {
+        args.push("--".to_string());
+        for (name, value) in constructor_args {
+            args.push(format!("--{name}"));
+            args.push(value.clone());
+        }
+    }
     Ok(args)
 }
 
@@ -224,7 +293,9 @@ fn run_stellar_deploy(
     wasm: &Path,
     source: &str,
     network: &NetworkArgs,
+    constructor_args: &[(String, String)],
     timeout: Option<Duration>,
+    alias: Option<&str>,
 ) -> Result<String> {
     log::debug!("deploying {}", wasm.display());
     // Command accepts OsStr, so actual deployment works even when the wasm
@@ -342,10 +413,23 @@ pub fn deploy(
     wasm_override: Option<&Path>,
     source: &str,
     network: &NetworkArgs,
+    constructor_args: &[(String, String)],
     timeout: Option<Duration>,
 ) -> Result<String> {
-    let wasm_path = build_if_needed(dir, wasm_override)?;
-    run_stellar_deploy(&wasm_path, source, network, timeout)
+    deploy_with_options(dir, wasm_override, source, network, timeout, &[], None)
+}
+
+fn deploy_with_options(
+    dir: &Path,
+    wasm_override: Option<&Path>,
+    source: &str,
+    network: &NetworkArgs,
+    timeout: Option<Duration>,
+    build_args: &[String],
+    alias: Option<&str>,
+) -> Result<String> {
+    let wasm_path = build_if_needed_with_args(dir, wasm_override, build_args)?;
+    run_stellar_deploy(&wasm_path, source, network, timeout, alias)
 }
 
 /// Names of arguments that may contain secret material and must be redacted
@@ -585,6 +669,132 @@ fn confirm(prompt: &str) -> bool {
     matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
+/// Default file name for the deployments record, written next to `forge.toml`
+/// (or the project root when no `forge.toml` exists).
+pub const DEPLOYMENTS_FILE: &str = "deployments.json";
+
+/// A single recorded deployment.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct DeploymentRecord {
+    /// The deployed contract ID (strkey `C…`).
+    pub contract_id: String,
+    /// Network name or RPC URL used during deployment.
+    pub network: String,
+    /// ISO-8601 UTC timestamp of the deployment.
+    pub deployed_at: String,
+}
+
+/// Deployments file: a map from `"<network>/<crate_name>"` to a list of
+/// `DeploymentRecord` entries (newest last).
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DeploymentsFile {
+    #[serde(default)]
+    pub deployments: std::collections::BTreeMap<String, Vec<DeploymentRecord>>,
+}
+
+impl DeploymentsFile {
+    /// Load from `path`, returning `Ok(Default)` when the file does not exist.
+    pub fn load(path: &Path) -> Result<Self> {
+        if !path.is_file() {
+            return Ok(Self::default());
+        }
+        let raw = std::fs::read_to_string(path)
+            .map_err(ForgeError::io(format!("reading {}", path.display())))?;
+        serde_json::from_str(&raw).map_err(|e| {
+            ForgeError::InvalidArgument(format!(
+                "could not parse deployments file {}: {e}",
+                path.display()
+            ))
+        })
+    }
+
+    /// Append `record` under key `<network>/<name>` and save.
+    pub fn record_and_save(
+        path: &Path,
+        name: &str,
+        network: &str,
+        contract_id: &str,
+    ) -> Result<()> {
+        let mut file = Self::load(path)?;
+        let key = format!("{network}/{name}");
+        let record = DeploymentRecord {
+            contract_id: contract_id.to_string(),
+            network: network.to_string(),
+            deployed_at: utc_now_iso8601(),
+        };
+        file.deployments.entry(key).or_default().push(record);
+        let json = serde_json::to_string_pretty(&file)
+            .map_err(|e| ForgeError::Other(format!("serialising deployments: {e}")))?;
+        std::fs::write(path, json + "\n")
+            .map_err(ForgeError::io(format!("writing {}", path.display())))
+    }
+
+    /// Return the most recently recorded contract ID for `<network>/<name>`,
+    /// if one exists.
+    pub fn latest_contract_id(&self, name: &str, network: &str) -> Option<&str> {
+        let key = format!("{network}/{name}");
+        self.deployments
+            .get(&key)
+            .and_then(|records| records.last())
+            .map(|r| r.contract_id.as_str())
+    }
+}
+
+/// Current UTC time formatted as an ISO-8601 string without sub-second precision.
+fn utc_now_iso8601() -> String {
+    // Use std only; no chrono dependency.
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // Decompose Unix timestamp into calendar fields (Gregorian, UTC).
+    let (y, mo, d, h, mi, s) = unix_secs_to_ymdhms(secs);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+fn unix_secs_to_ymdhms(mut secs: u64) -> (u32, u32, u32, u32, u32, u32) {
+    let s = (secs % 60) as u32;
+    secs /= 60;
+    let mi = (secs % 60) as u32;
+    secs /= 60;
+    let h = (secs % 24) as u32;
+    secs /= 24;
+    // Days since 1970-01-01
+    let (y, mo, d) = days_to_ymd(secs as u32);
+    (y, mo, d, h, mi, s)
+}
+
+fn days_to_ymd(mut days: u32) -> (u32, u32, u32) {
+    // Algorithm: civil_from_days by Howard Hinnant (public domain).
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    (y, mo, d)
+}
+
+/// Locate the deployments file relative to a project directory.
+///
+/// We write it to `dir/deployments.json` (same level as `forge.toml`).
+pub fn deployments_path(dir: &Path) -> PathBuf {
+    dir.join(DEPLOYMENTS_FILE)
+}
+
+/// Look up the most recent contract ID for `name` on `network` from the
+/// deployments file in `dir`.  Returns `None` if no record exists.
+pub fn lookup_recorded_contract_id(dir: &Path, name: &str, network: &str) -> Option<String> {
+    let path = deployments_path(dir);
+    let file = DeploymentsFile::load(&path).ok()?;
+    file.latest_contract_id(name, network)
+        .map(str::to_string)
+}
+
 /// The `deploy` subcommand.
 pub struct DeployPlugin;
 
@@ -636,20 +846,35 @@ impl ForgePlugin for DeployPlugin {
             .arg(
                 Arg::new("dry-run")
                     .long("dry-run")
-                    .action(clap::ArgAction::SetTrue)
+                    .action(ArgAction::SetTrue)
                     .help("Print the stellar command that would be run without submitting anything"),
             )
             .arg(
                 Arg::new("fund")
                     .long("fund")
-                    .action(clap::ArgAction::SetTrue)
+                    .action(ArgAction::SetTrue)
                     .help("Automatically fund an unfunded testnet source account via friendbot before deploying"),
+            )
+            .arg(
+                Arg::new("build-arg")
+                    .long("build-arg")
+                    .value_name("ARG")
+                    .action(clap::ArgAction::Append)
+                    .allow_hyphen_values(true)
+                    .help("Forward one argument to stellar contract build (repeatable, e.g. --build-arg=--features)"),
+            )
+            .arg(
+                Arg::new("alias")
+                    .long("alias")
+                    .value_name("NAME")
+                    .help("Register the deployed contract under this stellar-cli alias"),
             )
     }
 
     fn run(&self, matches: &ArgMatches, ctx: &ForgeContext) -> Result<()> {
         let dry_run = matches.get_flag("dry-run");
         let auto_fund = matches.get_flag("fund");
+        let no_record = matches.get_flag("no-record");
 
         // --dry-run does not submit anything but does need to resolve the wasm
         // path to show the full command; it is therefore allowed in offline mode.
@@ -667,6 +892,19 @@ impl ForgePlugin for DeployPlugin {
         let source = matches
             .get_one::<String>("source")
             .expect("source is required by clap");
+        let build_args: Vec<String> = matches
+            .get_many::<String>("build-arg")
+            .unwrap_or_default()
+            .cloned()
+            .collect();
+        let alias = matches.get_one::<String>("alias").map(String::as_str);
+
+        // Parse --arg NAME=VALUE pairs.
+        let constructor_args: Vec<(String, String)> = matches
+            .get_many::<String>("arg")
+            .unwrap_or_default()
+            .map(|raw| parse_constructor_arg(raw))
+            .collect::<Result<Vec<_>>>()?;
 
         let networks = resolve_network_targets(
             matches
@@ -922,6 +1160,30 @@ mod tests {
     }
 
     #[test]
+    fn build_flags_are_forwarded_to_stellar_contract_build() {
+        let args = build_stellar_build_args(&[
+            "--features".to_string(),
+            "experimental".to_string(),
+            "--profile".to_string(),
+            "release".to_string(),
+        ]);
+        assert_eq!(
+            args.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["contract", "build", "--features", "experimental", "--profile", "release"]
+        );
+    }
+
+    #[test]
+    fn deploy_alias_is_forwarded_to_stellar_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wasm = tmp.path().join("my_contract.wasm");
+        std::fs::write(&wasm, b"\0asm").unwrap();
+        let network = NetworkArgs::resolve(None, None, None);
+        let args = build_deploy_args_with_alias(&wasm, "alice", &network, Some("my_token")).unwrap();
+        assert!(args.windows(2).any(|pair| pair[0] == "--alias" && pair[1] == "my_token"));
+    }
+
+    #[test]
     fn format_dry_run_redacts_source_value() {
         let args = vec![
             "contract".to_string(),
@@ -964,6 +1226,13 @@ mod tests {
     fn help_documents_fund_flag() {
         let help = DeployPlugin.command().render_long_help().to_string();
         assert!(help.contains("--fund"), "{help}");
+    }
+
+    #[test]
+    fn help_documents_build_args_and_alias() {
+        let help = DeployPlugin.command().render_long_help().to_string();
+        assert!(help.contains("--build-arg"), "{help}");
+        assert!(help.contains("--alias"), "{help}");
     }
 
     #[test]
@@ -1071,5 +1340,162 @@ mod tests {
         );
         assert!(res.is_ok());
         assert!(!checked);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #280 — --arg NAME=VALUE (constructor arguments)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_constructor_arg_splits_on_first_equals() {
+        let (name, value) = parse_constructor_arg("admin=GABC").unwrap();
+        assert_eq!(name, "admin");
+        assert_eq!(value, "GABC");
+    }
+
+    #[test]
+    fn parse_constructor_arg_allows_equals_in_value() {
+        let (name, value) = parse_constructor_arg("token=abc=def").unwrap();
+        assert_eq!(name, "token");
+        assert_eq!(value, "abc=def");
+    }
+
+    #[test]
+    fn parse_constructor_arg_rejects_missing_equals() {
+        let err = parse_constructor_arg("noequalssign").unwrap_err();
+        assert!(err.to_string().contains("NAME=VALUE"), "{err}");
+    }
+
+    #[test]
+    fn parse_constructor_arg_rejects_empty_name() {
+        let err = parse_constructor_arg("=value").unwrap_err();
+        assert!(err.to_string().contains("empty name"), "{err}");
+    }
+
+    #[test]
+    fn build_deploy_args_with_constructor_appends_after_separator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wasm = tmp.path().join("contract.wasm");
+        std::fs::write(&wasm, b"\0asm").unwrap();
+        let network = NetworkArgs::resolve(None, None, None);
+        let ctor_args = vec![
+            ("admin".to_string(), "GABC".to_string()),
+            ("decimals".to_string(), "7".to_string()),
+        ];
+        let args = build_deploy_args_with_constructor(&wasm, "alice", &network, &ctor_args).unwrap();
+        let sep = args.iter().position(|a| a == "--").expect("separator not found");
+        assert!(args[sep + 1..].contains(&"--admin".to_string()), "{args:?}");
+        assert!(args[sep + 1..].contains(&"GABC".to_string()), "{args:?}");
+        assert!(args[sep + 1..].contains(&"--decimals".to_string()), "{args:?}");
+        assert!(args[sep + 1..].contains(&"7".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn build_deploy_args_with_no_constructor_args_omits_separator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wasm = tmp.path().join("contract.wasm");
+        std::fs::write(&wasm, b"\0asm").unwrap();
+        let network = NetworkArgs::resolve(None, None, None);
+        let args = build_deploy_args_with_constructor(&wasm, "alice", &network, &[]).unwrap();
+        assert!(!args.contains(&"--".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn command_exposes_arg_flag() {
+        let matches = DeployPlugin
+            .command()
+            .try_get_matches_from(vec![
+                "deploy",
+                "--source",
+                "alice",
+                "--arg",
+                "admin=GABC",
+                "--arg",
+                "decimals=7",
+            ])
+            .unwrap();
+        let args: Vec<&String> = matches.get_many::<String>("arg").unwrap().collect();
+        assert_eq!(args, vec!["admin=GABC", "decimals=7"]);
+    }
+
+    #[test]
+    fn help_documents_arg_flag() {
+        let help = DeployPlugin.command().render_long_help().to_string();
+        assert!(help.contains("--arg"), "{help}");
+        assert!(help.contains("NAME=VALUE"), "{help}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #281 — deployments.json
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn deployments_file_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("deployments.json");
+        DeploymentsFile::record_and_save(&path, "my_token", "testnet", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        let file = DeploymentsFile::load(&path).unwrap();
+        assert_eq!(
+            file.latest_contract_id("my_token", "testnet"),
+            Some("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        );
+    }
+
+    #[test]
+    fn deployments_file_records_newest_last() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("deployments.json");
+        DeploymentsFile::record_and_save(&path, "my_token", "testnet", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        DeploymentsFile::record_and_save(&path, "my_token", "testnet", "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB").unwrap();
+        let file = DeploymentsFile::load(&path).unwrap();
+        assert_eq!(
+            file.latest_contract_id("my_token", "testnet"),
+            Some("CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB")
+        );
+    }
+
+    #[test]
+    fn deployments_file_missing_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = DeploymentsFile::load(&tmp.path().join("deployments.json")).unwrap();
+        assert_eq!(file.latest_contract_id("my_token", "testnet"), None);
+    }
+
+    #[test]
+    fn deployments_file_different_networks_are_separate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("deployments.json");
+        DeploymentsFile::record_and_save(&path, "my_token", "testnet", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        DeploymentsFile::record_and_save(&path, "my_token", "mainnet", "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB").unwrap();
+        let file = DeploymentsFile::load(&path).unwrap();
+        assert_eq!(
+            file.latest_contract_id("my_token", "testnet"),
+            Some("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        );
+        assert_eq!(
+            file.latest_contract_id("my_token", "mainnet"),
+            Some("CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB")
+        );
+    }
+
+    #[test]
+    fn lookup_recorded_contract_id_returns_latest() {
+        let tmp = tempfile::tempdir().unwrap();
+        DeploymentsFile::record_and_save(
+            &tmp.path().join(DEPLOYMENTS_FILE),
+            "my_token",
+            "testnet",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ).unwrap();
+        assert_eq!(
+            lookup_recorded_contract_id(tmp.path(), "my_token", "testnet"),
+            Some("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string())
+        );
+    }
+
+    #[test]
+    fn help_documents_no_record_flag() {
+        let help = DeployPlugin.command().render_long_help().to_string();
+        assert!(help.contains("--no-record"), "{help}");
     }
 }
