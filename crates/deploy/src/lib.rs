@@ -115,6 +115,18 @@ impl NetworkArgs {
         }
     }
 
+    /// Whether this target is Stellar public network, which warrants an
+    /// explicit confirmation before spending real funds.
+    pub fn is_mainnet(&self) -> bool {
+        self.network
+            .as_deref()
+            .is_some_and(|network| matches!(network, "mainnet" | "public"))
+            || self
+                .network_passphrase
+                .as_deref()
+                .is_some_and(|passphrase| passphrase.contains("Public Global Stellar Network"))
+    }
+
     /// The corresponding `stellar` CLI arguments.
     pub fn cli_args(&self) -> Vec<String> {
         let mut args = Vec::new();
@@ -135,8 +147,11 @@ impl NetworkArgs {
 }
 
 fn path_str(path: &Path) -> Result<&str> {
-    path.to_str()
-        .ok_or_else(|| ForgeError::Other(format!("path {} is not valid UTF-8", path.display())))
+    path.to_str().ok_or_else(|| ForgeError::Other(format!(
+        "wasm path {} is not valid UTF-8; normal deployment passes native OS paths directly to stellar-cli, \
+         but --dry-run needs printable arguments. Pass --wasm from an ASCII-only path for --dry-run",
+        path.display()
+    )))
 }
 
 /// Build the contract in `dir` with the official `stellar contract build`.
@@ -282,13 +297,16 @@ fn run_stellar_deploy(
     timeout: Option<Duration>,
     alias: Option<&str>,
 ) -> Result<String> {
-    let args = build_deploy_args_with_alias(wasm, source, network, alias)?;
     log::debug!("deploying {}", wasm.display());
-
-    let result = soroban_forge_core::timeout::output_with_timeout(
-        std::process::Command::new("stellar").args(&args),
-        timeout,
-    );
+    // Command accepts OsStr, so actual deployment works even when the wasm
+    // path is not UTF-8 (notably on Windows user profiles).
+    let mut command = std::process::Command::new("stellar");
+    command
+        .args(["contract", "deploy", "--wasm"])
+        .arg(wasm.as_os_str())
+        .args(["--source", source]);
+    command.args(network.cli_args());
+    let result = soroban_forge_core::timeout::output_with_timeout(&mut command, timeout);
 
     match result {
         Ok(out) if out.status.success() => {
@@ -309,6 +327,70 @@ fn run_stellar_deploy(
             Err(ForgeError::ToolMissing("stellar-cli".into()))
         }
         Err(e) => Err(ForgeError::io("running stellar contract deploy")(e)),
+    }
+}
+
+/// Turn repeated network flags into distinct deployment targets. Named
+/// networks and explicit RPC targets deliberately cannot be mixed in one
+/// invocation because there is no unambiguous way to pair their credentials.
+pub fn resolve_network_targets(
+    networks: Vec<String>,
+    rpc_urls: Vec<String>,
+    passphrases: Vec<String>,
+) -> Result<Vec<NetworkArgs>> {
+    if !networks.is_empty() && !rpc_urls.is_empty() {
+        return Err(ForgeError::InvalidArgument(
+            "use repeated --network or repeated --rpc-url, not both in the same deploy".into(),
+        ));
+    }
+    let values = if networks.is_empty() { rpc_urls } else { networks };
+    if values.is_empty() {
+        return Ok(vec![NetworkArgs::resolve(None, None, None)]);
+    }
+    if !passphrases.is_empty() && passphrases.len() != 1 && passphrases.len() != values.len() {
+        return Err(ForgeError::InvalidArgument(
+            "supply one --network-passphrase for all targets or one per target".into(),
+        ));
+    }
+    let is_rpc = networks.is_empty();
+    Ok(values
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let passphrase = passphrases
+                .get(if passphrases.len() == 1 { 0 } else { index })
+                .cloned();
+            if is_rpc {
+                NetworkArgs::resolve(None, Some(value), passphrase)
+            } else {
+                NetworkArgs::resolve(Some(value), None, passphrase)
+            }
+        })
+        .collect())
+}
+
+fn require_mainnet_confirmation<F>(
+    network: &NetworkArgs,
+    yes: bool,
+    interactive: bool,
+    mut confirm_fn: F,
+) -> Result<()>
+where
+    F: FnMut(&str) -> bool,
+{
+    if !network.is_mainnet() || yes {
+        return Ok(());
+    }
+    if !interactive {
+        return Err(ForgeError::InvalidArgument(format!(
+            "refusing to deploy to mainnet ({}) without confirmation in a non-interactive terminal; pass --yes to proceed",
+            network.label()
+        )));
+    }
+    if confirm_fn(&format!("Deploy this contract to mainnet ({})?", network.label())) {
+        Ok(())
+    } else {
+        Err(ForgeError::InvalidArgument("mainnet deployment cancelled".into()))
     }
 }
 
@@ -746,16 +828,19 @@ impl ForgePlugin for DeployPlugin {
                 Arg::new("network")
                     .long("network")
                     .short('n')
+                    .action(clap::ArgAction::Append)
                     .help("Configured network to deploy to [default: testnet]"),
             )
             .arg(
                 Arg::new("rpc-url")
                     .long("rpc-url")
+                    .action(clap::ArgAction::Append)
                     .help("RPC endpoint to use instead of a configured network"),
             )
             .arg(
                 Arg::new("network-passphrase")
                     .long("network-passphrase")
+                    .action(clap::ArgAction::Append)
                     .help("Network passphrase for --rpc-url"),
             )
             .arg(
@@ -821,54 +906,86 @@ impl ForgePlugin for DeployPlugin {
             .map(|raw| parse_constructor_arg(raw))
             .collect::<Result<Vec<_>>>()?;
 
-        let network = NetworkArgs::resolve(
-            matches.get_one::<String>("network").cloned(),
-            matches.get_one::<String>("rpc-url").cloned(),
-            matches.get_one::<String>("network-passphrase").cloned(),
-        );
+        let networks = resolve_network_targets(
+            matches
+                .get_many::<String>("network")
+                .unwrap_or_default()
+                .cloned()
+                .collect(),
+            matches
+                .get_many::<String>("rpc-url")
+                .unwrap_or_default()
+                .cloned()
+                .collect(),
+            matches
+                .get_many::<String>("network-passphrase")
+                .unwrap_or_default()
+                .cloned()
+                .collect(),
+        )?;
 
-        if !dry_run && !ctx.offline && network.is_testnet() {
-            ensure_source_funded(source, &network, auto_fund, ctx)?;
+        if !dry_run && !ctx.offline {
+            use std::io::IsTerminal;
+            let interactive = !ctx.json
+                && std::io::stdin().is_terminal()
+                && std::io::stdout().is_terminal();
+            for network in &networks {
+                require_mainnet_confirmation(network, ctx.yes, interactive, confirm)?;
+                if network.is_testnet() {
+                    ensure_source_funded(source, network, auto_fund, ctx)?;
+                }
+            }
         }
 
         if dry_run {
-            let wasm_path = build_if_needed_with_args(&dir, wasm_override.as_deref(), &build_args)?;
-            let args = build_deploy_args_with_alias(&wasm_path, source, &network, alias)?;
-            let command_line = format_dry_run_command("stellar", &args);
+            let wasm_path = build_if_needed(&dir, wasm_override.as_deref())?;
+            let commands: Result<Vec<String>> = networks
+                .iter()
+                .map(|network| build_deploy_args(&wasm_path, source, network)
+                    .map(|args| format_dry_run_command("stellar", &args)))
+                .collect();
+            let commands = commands?;
             if ctx.json {
-                let report = serde_json::json!({ "command": command_line });
+                let report = serde_json::json!({ "commands": commands });
                 println!("{}", serde_json::to_string_pretty(&report).unwrap());
             } else {
-                println!("{command_line}");
+                for command in commands {
+                    println!("{command}");
+                }
             }
             return Ok(());
         }
 
-        let contract_id = deploy_with_options(
-            &dir,
-            wasm_override.as_deref(),
-            source,
-            &network,
-            ctx.timeout(),
-            &build_args,
-            alias,
-        )?;
+        // Resolve and (if necessary) build exactly once, then deploy the same
+        // immutable wasm to every requested target.
+        let wasm_path = build_if_needed(&dir, wasm_override.as_deref())?;
+        let reports: Result<Vec<(String, String)>> = networks
+            .iter()
+            .map(|network| {
+                run_stellar_deploy(&wasm_path, source, network, ctx.timeout())
+                    .map(|contract_id| (network.label(), contract_id))
+            })
+            .collect();
+        let reports = reports?;
 
         if ctx.json {
-            let report = serde_json::json!({
-                "contract_id": contract_id,
-                "network": network.label(),
-                "alias": alias,
-            });
+            let report: Vec<_> = reports
+                .iter()
+                .map(|(network, contract_id)| serde_json::json!({
+                    "contract_id": contract_id,
+                    "network": network,
+                }))
+                .collect();
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
         } else if !ctx.quiet {
-            println!("deployed to {}", network.label());
-            println!("contract ID: {contract_id}");
-            if let Some(alias) = alias {
-                println!("alias: {alias}");
+            for (network, contract_id) in reports {
+                println!("deployed to {network}");
+                println!("contract ID: {contract_id}");
             }
         } else {
-            println!("{contract_id}");
+            for (_, contract_id) in reports {
+                println!("{contract_id}");
+            }
         }
         Ok(())
     }
@@ -949,6 +1066,38 @@ mod tests {
     }
 
     #[test]
+    fn repeated_networks_produce_one_target_each() {
+        let targets = resolve_network_targets(
+            vec!["testnet".into(), "futurenet".into()],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].label(), "testnet");
+        assert_eq!(targets[1].label(), "futurenet");
+    }
+
+    #[test]
+    fn mainnet_confirmation_is_skipped_with_yes() {
+        let network = NetworkArgs::resolve(Some("mainnet".into()), None, None);
+        let mut prompted = false;
+        require_mainnet_confirmation(&network, true, false, |_| {
+            prompted = true;
+            false
+        })
+        .unwrap();
+        assert!(!prompted);
+    }
+
+    #[test]
+    fn mainnet_confirmation_requires_yes_when_not_interactive() {
+        let network = NetworkArgs::resolve(Some("mainnet".into()), None, None);
+        let err = require_mainnet_confirmation(&network, false, false, |_| true).unwrap_err();
+        assert!(err.to_string().contains("pass --yes"), "{err}");
+    }
+
+    #[test]
     fn extracts_the_last_contract_id_line() {
         let stdout = "ℹ️ deploying...\nsuccess\nCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n";
         assert_eq!(
@@ -960,6 +1109,18 @@ mod tests {
     #[test]
     fn no_contract_id_found_returns_none() {
         assert_eq!(extract_contract_id("deploy failed\n"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_dry_run_path_explains_the_workaround() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xFF]));
+        let err = path_str(&path).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("not valid UTF-8"), "{message}");
+        assert!(message.contains("ASCII-only path"), "{message}");
     }
 
     #[test]
