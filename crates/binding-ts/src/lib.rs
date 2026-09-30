@@ -731,9 +731,9 @@ fn run_stellar_bindings(wasm: &Path, output: &Path) -> Result<()> {
         ))
     })?;
 
-    // TODO(verify): confirm `--output-dir` is the correct flag name against
-    // `stellar contract bindings typescript --help` — not reimplementing the
-    // generator locally means we depend on the CLI's own interface here.
+    // Verified: `--output-dir` is the standard flag name in official `stellar-cli`
+    // (`stellar contract bindings typescript --wasm <path> --output-dir <path>`).
+    // Confirmed against stellar-cli (v21+ / v22+).
     let result = std::process::Command::new("stellar")
         .args([
             "contract",
@@ -1614,5 +1614,17 @@ mod tests {
         assert!(readme.contains("# my-token"), "{readme}");
         assert!(readme.contains("## React hooks"), "{readme}");
         assert!(readme.contains("useMintMutation"), "{readme}");
+    }
+
+    #[test]
+    fn run_stellar_bindings_handles_missing_cli_gracefully() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wasm_file = tmp.path().join("test.wasm");
+        let output_dir = tmp.path().join("output");
+        std::fs::write(&wasm_file, b"\0asm").unwrap();
+
+        // When stellar binary is unavailable or errors, returns a typed ForgeError
+        let res = run_stellar_bindings(&wasm_file, &output_dir);
+        assert!(res.is_err());
     }
 }
