@@ -45,6 +45,7 @@ pub const CONTRACT_ID_LEN: usize = 56;
 
 /// Every wasm module starts with these four bytes.
 const WASM_MAGIC: &[u8] = b"\0asm";
+const WASM_VERSION_1: &[u8] = b"\x01\0\0\0";
 
 #[derive(Deserialize)]
 struct Manifest {
@@ -151,9 +152,17 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 pub fn hash_wasm_file(path: &Path) -> Result<String> {
     let bytes =
         std::fs::read(path).map_err(ForgeError::io(format!("reading {}", path.display())))?;
-    if !bytes.starts_with(WASM_MAGIC) {
+    if bytes.len() < WASM_MAGIC.len() || !bytes.starts_with(WASM_MAGIC) {
         return Err(ForgeError::InvalidArgument(format!(
             "{} is not a wasm module (missing the \\0asm header)",
+            path.display()
+        )));
+    }
+    if bytes.len() < WASM_MAGIC.len() + WASM_VERSION_1.len()
+        || &bytes[WASM_MAGIC.len()..WASM_MAGIC.len() + WASM_VERSION_1.len()] != WASM_VERSION_1
+    {
+        return Err(ForgeError::InvalidArgument(format!(
+            "{} is a corrupted wasm module (expected version 1 header)",
             path.display()
         )));
     }
@@ -188,7 +197,7 @@ impl NetworkArgs {
         from_config: Option<&ConfigNetwork>,
     ) -> Self {
         let cfg = from_config.cloned().unwrap_or_default();
-        let cli_network = network;
+        let cli_network = network.map(normalize_network_name);
         let cli_rpc = rpc_url;
         let network = match (cli_network.as_ref(), cli_rpc.as_ref()) {
             (Some(name), _) => Some(name.clone()),
@@ -232,6 +241,16 @@ impl NetworkArgs {
             args.push(passphrase.clone());
         }
         args
+    }
+}
+
+/// Normalize only well-known stellar-cli network presets. Custom named
+/// networks may be case-sensitive, so they pass through untouched.
+fn normalize_network_name(value: String) -> String {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "testnet" | "mainnet" | "futurenet" | "standalone" => normalized,
+        _ => value,
     }
 }
 
@@ -963,6 +982,16 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_wasm_with_a_corrupted_version_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("corrupt.wasm");
+        std::fs::write(&path, b"\0asm\x02\0\0\0payload").unwrap();
+
+        let err = hash_wasm_file(&path).unwrap_err();
+        assert!(err.to_string().contains("corrupted wasm"), "{err}");
+    }
+
+    #[test]
     fn accepts_a_well_formed_contract_id() {
         assert!(validate_contract_id(VALID_ID).is_ok());
     }
@@ -1081,6 +1110,12 @@ mod tests {
     fn an_explicit_network_is_passed_through() {
         let network = NetworkArgs::resolve(Some("mainnet".into()), None, None, None);
         assert_eq!(network.cli_args(), vec!["--network", "mainnet"]);
+    }
+
+    #[test]
+    fn normalizes_well_known_network_names() {
+        let network = NetworkArgs::resolve(Some("  TestNet  ".into()), None, None, None);
+        assert_eq!(network.cli_args(), vec!["--network", "testnet"]);
     }
 
     #[test]
